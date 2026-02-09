@@ -1,0 +1,47 @@
+Summary: Model training
+-----------------------
+
+"device_type":  cpu
+
+"seed":  None
+
+"model_directory":  /cluster/scratch/rbarreira/material_patches/src/graphorge/projects/material_patches/optimization/cluster_setup/hyperparameter_opt/grid_search/elastic/quad4/8x8/ntime1/epd_coordhist_disphist_edgevec_reldisp_all_5000/trial_2338/model
+
+"load_model_state":  None
+
+"n_max_epochs":  1000
+
+"is_model_in_normalized":  True
+
+"is_model_out_normalized":  True
+
+"batch_size":  16
+
+"is_sampler_shuffle":  False
+
+"loss_nature":  node_features_out
+
+"loss_type":  mse
+
+"loss_kwargs":  None
+
+"opt_algorithm":  adam
+
+"lr_init":  0.001
+
+"lr_scheduler_type":  explr
+
+"lr_scheduler_kwargs":
+  "gamma": 0.9954054173
+
+"Number of completed epochs":  1000
+
+"Training data set file":  None
+
+"Training data set size":  4000
+
+"Best loss: ":  2.09039309e-07 (training epoch 999)
+
+"Total training time":  1 day, 5:11:09
+
+"Avg. training time per epoch":  0:01:45

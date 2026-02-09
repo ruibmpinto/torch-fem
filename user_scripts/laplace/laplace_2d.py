@@ -13,14 +13,14 @@ Analytical solution: φ(x,y) = x
 import sys
 import os
 # Add local src to path to use modified code
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..', 'src'))
 
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
 from torchfem.planar import Planar
 from torchfem.operators import DiffusionOperator
-
+from torchfem.mesh import rect_quad
 
 def create_mesh(nx: int, ny: int, lx: float = 1.0, ly: float = 1.0):
     """

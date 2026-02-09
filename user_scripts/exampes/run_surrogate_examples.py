@@ -22,7 +22,9 @@ from torchfem.materials import IsotropicElasticityPlaneStress
 import matplotlib.pyplot as plt
 
 
-output_dir = ( f"results/examples/cantilever")
+script_dir = os.path.dirname(os.path.abspath(__file__))
+results_base = os.path.join(os.path.dirname(script_dir), 'results')
+output_dir = os.path.join(results_base, 'examples', 'cantilever')
 os.makedirs(output_dir, exist_ok=True)
 
 

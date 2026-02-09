@@ -38,7 +38,7 @@ from torchfem.materials import (
 from torchfem.mesh import cube_hexa, rect_quad
 from torchfem.elements import linear_to_quadratic
 
-from utils.mechanical_quantities import prescribe_disps_by_coords
+from utils.boundary_conditons import prescribe_disps_by_coords
 
 # Matplotlib.pyplot default parameters
 plt.rcParams.update({
@@ -109,39 +109,19 @@ def run_simulation_surrogate(
         dim = 3
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Default model path if not provided
+    # Models stored in results/matpatch_surrogates/{behavior}/{NxN}/model
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    surrogates_dir = os.path.join(script_dir, 'matpatch_surrogates')
     if model_path is None:
+        patch_str = f'{patch_size_x}x{patch_size_y}'
+        if dim == 3:
+            patch_str = f'{patch_size_x}x{patch_size_y}x{patch_size_z}'
         if material_behavior == 'elastoplastic':
-            model_path = (
-                # "/Users/rbarreira/Desktop/machine_learning/material_patches/"
-                # "graphorge_material_patches/src/graphorge/projects/"
-                # "material_patches/elastoplastic/2d/quad4/mesh1x1/ninc100/"
-                # "scaler_minmax/reference/3_model"
-                "/Users/rbarreira/Desktop/machine_learning/material_patches/"
-                "graphorge_material_patches/src/graphorge/projects/"
-                "material_patches/elastoplastic/2d/quad4/mesh1x1/ninc100/"
-                "test_1/reference/3_model"
-                # "/Users/rbarreira/Desktop/machine_learning/material_patches/"
-                # "graphorge_material_patches/src/graphorge/projects/"
-                # "material_patches/elastic/2d/quad4/mesh1x1/ninc1/"
-                # "long_training_rnn/reference/3_model"
-                # '/Users/rbarreira/Desktop/machine_learning/'
-                #     'material_patches/graphorge_material_patches/src/'
-                #     'graphorge/projects/material_patches/elastic/'
-                #     '2d/quad4/mesh1x1/ninc100/27_force_equilibrium_rnn/'
-                #     'reference/3_model'
-            )
+            model_path = os.path.join(
+                surrogates_dir, 'elastoplastic_nlh', patch_str, 'model')
         elif material_behavior == 'elastic':
-            model_path = (
-                # "/Users/rbarreira/Desktop/machine_learning/material_patches/"
-                # "graphorge_material_patches/src/graphorge/projects/"
-                # "material_patches/elastic/2d/quad4/mesh1x1/ninc1/"
-                # "long_training_rnn/reference/3_model"
-                '/Users/rbarreira/Desktop/machine_learning/'
-                'material_patches/graphorge_material_patches/src/'
-                'graphorge/projects/material_patches/elastic/'
-                '2d/quad4/mesh3x3/ninc1/stiffness_prediction_ffnn/'
-                'reference/3_model'
-            )
+            model_path = os.path.join(
+                surrogates_dir, 'elastic', patch_str, 'model')
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Constitutive law
     if material_behavior == 'elastic':
@@ -305,81 +285,107 @@ def run_simulation_surrogate(
         patch_boundary_nodes_dict[patch_id] = torch.tensor(
             sorted(list(patch_boundary_set)), dtype=torch.long)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Boundary conditions - load boundary conditions from material patch file
-    bc_filepath = (
-        '/Users/rbarreira/Desktop/machine_learning/material_patches/'
-        '_input_material_patches/material_patches_generation_2d_quad4_'
-        'mesh_1x1/material_patch_0/material_patch/'
-        'material_patch_attributes.pkl')
-    with open(bc_filepath, 'rb') as file:
-        matpatch = pkl.load(file)
-    # Apply displacements using prescribe_disps_by_coords
-    _, nodes_constrained = prescribe_disps_by_coords(
-        domain=domain, data=matpatch, dim=dim)
+    # Boundary conditions
+    # # OLD: Load boundary conditions from material patch file (1x1 only)
+    # bc_filepath = (
+    #     '/Users/rbarreira/Desktop/machine_learning/material_patches/'
+    #     '_input_material_patches/material_patches_generation_2d_quad4_'
+    #     'mesh_1x1/material_patch_0/material_patch/'
+    #     'material_patch_attributes.pkl')
+    # with open(bc_filepath, 'rb') as file:
+    #     matpatch = pkl.load(file)
+    # _, nodes_constrained = prescribe_disps_by_coords(
+    #     domain=domain, data=matpatch, dim=dim)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Simple tension test BCs
+    tol = 1e-6
+    for i, node_coord in enumerate(nodes):
+        # Bottom edge: fix y
+        if torch.abs(node_coord[1]) < tol:
+            domain.displacements[i, 1] = 0.0
+            domain.constraints[i, 1] = True
+            # Bottom-left corner: also fix x
+            if torch.abs(node_coord[0]) < tol:
+                domain.displacements[i, 0] = 0.0
+                domain.constraints[i, 0] = True
+        # Top edge: prescribe vertical displacement
+        elif torch.abs(node_coord[1] - 1.0) < tol:
+            domain.displacements[i, 1] = 0.05
+            domain.constraints[i, 1] = True
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Compute reference solution WITHOUT internal node constraints
+    # (all nodes free to move)
+    print_status("BEFORE_SOLVE")
+    if material_behavior == 'elastoplastic':
+        increments_ref = torch.linspace(0.0, 1.0, 51)
+    else:
+        increments_ref = torch.linspace(0.0, 1.0, 5)
 
+    # Profile solve method
+    profiler_solve = cProfile.Profile()
+    profiler_solve.enable()
+    u_ref, f_ref, _, _, _ = domain.solve(
+        increments=increments_ref, rtol=1e-8)
+    profiler_solve.disable()
+    print("\n=== SOLVE METHOD PROFILE ===")
+    stats_solve = pstats.Stats(profiler_solve)
+    stats_solve.sort_stats('cumulative').print_stats(15)
+    print_status("AFTER_SOLVE")
+
+    # Plot reference solution
+    u_ref_final = u_ref[-1]
+    # Compute reference colorbar limits
+    u_ref_norm = torch.norm(u_ref_final, dim=1)
+    vmin_ref = u_ref_norm.min().item()
+    vmax_ref = u_ref_norm.max().item()
+
+    domain.plot(
+        u=u_ref_final,
+        node_property=u_ref_norm,
+        title=r'Reference: $||\mathbf{u}||_{2}$ (no internal '
+              r'constraints)',
+        colorbar=True,
+        cmap='viridis',
+        vmin=vmin_ref,
+        vmax=vmax_ref
+    )
+    mesh_str = f"{mesh_nx}x{mesh_ny}"
+    patch_str = f"{patch_size_x}x{patch_size_y}"
+    if dim == 3:
+        mesh_str += f"x{mesh_nz}"
+        patch_str += f"x{patch_size_z}"
+    n_increments = len(increments_ref) - 1
+    output_dir = (
+        f"results/{material_behavior}/{dim}d/{element_type}/"
+        f"mesh_{mesh_str}/patch_{patch_str}/"
+        f"n_time_inc_{n_increments}")
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(
+        output_dir, "disp_field_ref.png")
+    plt.savefig(plot_path)
+    plt.close()
+    print(f"Reference solution saved to {plot_path}")
+
+    # Save reference results
+    results_ref = {
+        'displacements': u_ref.detach().cpu().numpy(),
+        'forces': f_ref.detach().cpu().numpy()
+    }
+    ref_file = os.path.join(output_dir, "results_reference.pkl")
+    with open(ref_file, 'wb') as fh:
+        pkl.dump(results_ref, fh)
+    print(f"Reference results saved to {ref_file}")
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Constrain internal patch nodes (zero displacement, all DOFs)
+    # for surrogate solve
     for node_id in patch_internal_nodes:
         domain.displacements[node_id, :] = 0.0
         domain.constraints[node_id, :] = True
-    # # OLD APPROACH: Simple tension test
-    # nodes_constrained = []
-    # num_applied_disps = 0
-    #
-    # if dim == 2:
-    #     # Simple tension test for 2D
-    #     # Fix bottom edge (y=0), apply displacement to top edge (y=1)
-    #     for i, node_coord in enumerate(nodes):
-    #         # Fix bottom edge (y=0)
-    #         if torch.abs(node_coord[1]) < 1e-6:
-    #             domain.displacements[i, 0] = 0.0
-    #             domain.displacements[i, 1] = 0.0
-    #             domain.constraints[i, 0] = True
-    #             domain.constraints[i, 1] = True
-    #             nodes_constrained.append(i)
-    #             num_applied_disps += 1
-    #
-    #         # Apply displacement to top edge (y=1)
-    #         elif torch.abs(node_coord[1] - 1.0) < 1e-6:
-    #             domain.displacements[i, 0] = 0.0
-    #             domain.displacements[i, 1] = 0.01
-    #             domain.constraints[i, 0] = True
-    #             domain.constraints[i, 1] = True
-    #             nodes_constrained.append(i)
-    #             num_applied_disps += 1
-    # elif dim == 3:
-    #     # Simple tension test for 3D
-    #     # Fix bottom face (z=0), apply displacement to top face (z=1)
-    #     for i, node_coord in enumerate(nodes):
-    #         # Fix bottom face (z=0)
-    #         if torch.abs(node_coord[2]) < 1e-6:
-    #             domain.displacements[i, 0] = 0.0
-    #             domain.displacements[i, 1] = 0.0
-    #             domain.displacements[i, 2] = 0.0
-    #             domain.constraints[i, 0] = True
-    #             domain.constraints[i, 1] = True
-    #             domain.constraints[i, 2] = True
-    #             nodes_constrained.append(i)
-    #             num_applied_disps += 1
-    #
-    #         # Apply displacement to top face (z=1)
-    #         elif torch.abs(node_coord[2] - 1.0) < 1e-6:
-    #             domain.displacements[i, 0] = 0.0
-    #             domain.displacements[i, 1] = 0.0
-    #             domain.displacements[i, 2] = 0.1
-    #             domain.constraints[i, 0] = True
-    #             domain.constraints[i, 1] = True
-    #             domain.constraints[i, 2] = True
-    #             nodes_constrained.append(i)
-    #             num_applied_disps += 1
-    #
-    # # print(f"Applied boundary conditions to {num_applied_disps} nodes")
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Solver
     # Create more increments for elastoplastic simulation
     if material_behavior == 'elastoplastic':
-        # Use 50 loading steps for elastoplastic simulation
-        # increments = torch.linspace(0.0, 1.0, 5)
-        increments = torch.tensor(matpatch['load_factor_time_series'])
+        increments = torch.linspace(0.0, 1.0, 51)
         # RNN-like behavior
         is_stepwise = True 
     else:
@@ -391,13 +397,16 @@ def run_simulation_surrogate(
         is_stepwise = False 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     mesh_str = f"{mesh_nx}x{mesh_ny}"
+    patch_str = f"{patch_size_x}x{patch_size_y}"
     if dim == 3:
         mesh_str += f"x{mesh_nz}"
-    n_increments = len(increments) - 1  
-    
+        patch_str += f"x{patch_size_z}"
+    n_increments = len(increments) - 1
+
     output_dir = (
         f"results/{material_behavior}/{dim}d/{element_type}/"
-        f"mesh_{mesh_str}/n_time_inc_{n_increments}")
+        f"mesh_{mesh_str}/patch_{patch_str}/"
+        f"n_time_inc_{n_increments}")
     os.makedirs(output_dir, exist_ok=True)
     
     # Plot mesh colored by material patch ID
@@ -431,27 +440,18 @@ def run_simulation_surrogate(
     plt.close()
 
 
-    breakpoint()
+    # breakpoint()
 
-
-    print_status("BEFORE_SOLVE")
-    # Start profiling
-    # profiler = cProfile.Profile()
-    # profiler.enable()
-    # Profile solve method
-    profiler_solve = cProfile.Profile()
-    profiler_solve.enable()
-    u_ref, f_ref, _, _, _ = domain.solve(increments=increments, rtol=1e-8)
-    profiler_solve.disable()
-    print("\n=== SOLVE METHOD PROFILE ===")
-    stats_solve = pstats.Stats(profiler_solve)
-    stats_solve.sort_stats('cumulative').print_stats(15)
-    print_status("AFTER_SOLVE")
 
     print_status("BEFORE_SOLVE_MATPATCH")
     # Profile solve_matpatch method
     profiler_matpatch = cProfile.Profile()
     profiler_matpatch.enable()
+    # Build patch_elem_per_dim list
+    if dim == 2:
+        patch_elem_per_dim = [patch_size_x, patch_size_y]
+    elif dim == 3:
+        patch_elem_per_dim = [patch_size_x, patch_size_y, patch_size_z]
     u, f, _, _, _ = domain.solve_matpatch(
         is_mat_patch=is_mat_patch,
         increments=increments,
@@ -462,7 +462,8 @@ def run_simulation_surrogate(
         return_volumes=False,
         is_stepwise=is_stepwise,
         model_directory=model_path,
-        patch_boundary_nodes=patch_boundary_nodes_dict
+        patch_boundary_nodes=patch_boundary_nodes_dict,
+        patch_elem_per_dim=patch_elem_per_dim
     )
     profiler_matpatch.disable()
     print("\n=== SOLVE_MATPATCH METHOD PROFILE ===")
@@ -481,16 +482,19 @@ def run_simulation_surrogate(
     # Outputs
     # Create directory structure for outputs
     mesh_str = f"{mesh_nx}x{mesh_ny}"
+    patch_str = f"{patch_size_x}x{patch_size_y}"
     if dim == 3:
         mesh_str += f"x{mesh_nz}"
-    
+        patch_str += f"x{patch_size_z}"
+
     # Determine number of increments for output directory
     # WHY: # Subtract 1 for initial condition
-    n_increments = len(increments) - 1  
-    
+    n_increments = len(increments) - 1
+
     output_dir = (
         f"results/{material_behavior}/{dim}d/{element_type}/"
-        f"mesh_{mesh_str}/n_time_inc_{n_increments}")
+        f"mesh_{mesh_str}/patch_{patch_str}/"
+        f"n_time_inc_{n_increments}")
     os.makedirs(output_dir, exist_ok=True)
     # Save results
     results = {
@@ -505,7 +509,6 @@ def run_simulation_surrogate(
     
     print(f"Results saved to {output_file}")
 
-
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Plot boundary conditions
     domain.plot()
@@ -517,32 +520,37 @@ def run_simulation_surrogate(
     # Plot displacement field
     # Get final displacement field
     # Shape: (n_nodes, n_dim)
-    u_final = u[-1]  
+    u_final = u[-1]
 
     domain.plot(
         u=u_final,
         node_property=torch.norm(u_final, dim=1),
-        title=r'Displacement Magnitude $||\mathbf{u}||_{2}$',
+        title=r'Surrogate: $||\mathbf{u}||_{2}$',
         colorbar=True,
-        cmap='viridis', vmin=0.0, vmax=0.01
+        cmap='viridis',
+        vmin=vmin_ref,
+        vmax=vmax_ref
     )
 
-    plot_path = os.path.join(output_dir, "displacement_field.png")
+    plot_path = os.path.join(output_dir, "disp_field_srg.png")
     plt.savefig(plot_path)
     plt.close()
-    
 
-    u_diff = torch.abs(u[-1] - u_ref[-1]) 
+
+    u_diff = torch.abs(u[-1] - u_ref[-1])
 
     domain.plot(
         u=u_diff,
         node_property=torch.norm(u_diff, dim=1),
-        title=r'$||\mathbf{u}_{pred} - \mathbf{u}_{ref}||_{2}$',
+        title=r'$||\mathbf{u}_{srg} - '
+              r'\mathbf{u}_{ref}||_{2}$',
         colorbar=True,
-        cmap='viridis', vmin=0.0, vmax=0.01
+        cmap='viridis',
+        vmin=vmin_ref,
+        vmax=vmax_ref
     )
 
-    plot_path = os.path.join(output_dir, "displacement_field_difference.png")
+    plot_path = os.path.join(output_dir, "disp_field_diff.png")
     plt.savefig(plot_path)
     plt.close()
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -581,8 +589,8 @@ if __name__ == '__main__':
     run_simulation_surrogate(
         element_type='quad4',
         material_behavior='elastic',
-        mesh_nx=12,
-        mesh_ny=12,
-        mesh_nz=12,
-        patch_size_x=6,
-        patch_size_y=6)
+        mesh_nx=8,
+        mesh_ny=8,
+        mesh_nz=8,
+        patch_size_x=2,
+        patch_size_y=2)

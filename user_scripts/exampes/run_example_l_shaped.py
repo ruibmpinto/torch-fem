@@ -110,9 +110,15 @@ def run_l_shape_example():
             model_directory=model_path)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Visualize
-    output_dir = 'results/elastic'
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    results_base = os.path.join(
+        os.path.dirname(script_dir), 'results')
+    output_dir = os.path.join(
+        results_base, 'elastic', '2d', 'quad4', 'L_shaped')
+    os.makedirs(output_dir, exist_ok=True)
+
     model.plot(node_markers=True)
-    plot_path = f"{output_dir}/l_shaped_1_mesh.png"
+    plot_path = os.path.join(output_dir, "l_shaped_1_mesh.png")
     plt.savefig(plot_path, dpi=300)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Plot deformed configuration
@@ -120,20 +126,20 @@ def run_l_shape_example():
     model.plot(u=u[-1], node_property=torch.norm(u[-1], dim=1),
             title=r'Displacement Magnitude $||\mathbf{u}||_{2}$',
             colorbar=True, cmap='viridis', vmin=0.0, vmax=0.025)
-    plot_path = f"{output_dir}/l_shaped_2_disp_surrogate.png"
+    plot_path = os.path.join(output_dir, "l_shaped_2_disp_surrogate.png")
     plt.savefig(plot_path, dpi=300)
     # Reference solver
     model.plot(u=u_ref[-1], node_property=torch.norm(u_ref[-1], dim=1),
             title=r'Ref. Displacement Magnitude $||\mathbf{u}||_{2}$',
             colorbar=True, cmap='viridis', vmin=0.0, vmax=0.025)
-    plot_path = f"{output_dir}/l_shaped_3_disp_reference.png"
+    plot_path = os.path.join(output_dir, "l_shaped_3_disp_reference.png")
     plt.savefig(plot_path, dpi=300)
     # Difference between surrogate model and reference displacements
-    u_diff = torch.abs(u[-1] - u_ref[-1]) 
+    u_diff = torch.abs(u[-1] - u_ref[-1])
     model.plot(u=u_diff, node_property=torch.norm(u_diff, dim=1),
             title=r'$||\mathbf{u}_{pred} - \mathbf{u}_{ref}||_{2}$',
             colorbar=True, cmap='viridis', vmin=0.0, vmax=0.025)
-    plot_path = f"{output_dir}/l_shaped_4_difference.png"
+    plot_path = os.path.join(output_dir, "l_shaped_4_difference.png")
     plt.savefig(plot_path, dpi=300)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Plot force prediction
@@ -141,7 +147,7 @@ def run_l_shape_example():
     model.plot(u=u[-1], node_property=torch.norm(f[-1], dim=1),
             title=r'Force Magnitude $||\mathbf{f}||_{2}$',
             colorbar=True, cmap='viridis')
-    plot_path = f"{output_dir}/l_shaped_5_force_surrogate.png"
+    plot_path = os.path.join(output_dir, "l_shaped_5_force_surrogate.png")
     plt.savefig(plot_path, dpi=300)
 # -----------------------------------------------------------------------------
 # def create_unit_element_l_mesh(element_size=1.0, n_elements=20):

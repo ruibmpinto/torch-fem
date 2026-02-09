@@ -136,15 +136,15 @@ class Simulation:
 
         if self.dim == 2:
             self.dir_path = (
-                f'{out_filepath}_data_2/{self.material_behavior}/'
+                f'{out_filepath}_data/{self.material_behavior}/'
                 f'{self.dim}d/{self.element_type}/'
-                f'mesh_{self.mesh_nx}x{self.mesh_ny}/'
+                f'mesh{self.mesh_nx}x{self.mesh_ny}/'
                 f'ninc{self.num_increments}/')
             self.input_filename = (
                 f'{self.filepath}material_patches_generation_'
                 f'{self.dim}d_{self.element_type}_mesh_'
                 f'{self.mesh_nx}x{self.mesh_ny}/'
-                f'material_patch_{self.patch_idx}/material_patch/'
+                f'random_specimen_{self.patch_idx}/material_patch/'
                 f'material_patch_attributes.pkl')
         elif self.dim == 3:
             if self.element_type not in [
@@ -160,7 +160,7 @@ class Simulation:
                 f'{self.filepath}material_patches_generation_'
                 f'{self.dim}d_{self.element_type}_'
                 f'mesh{self.mesh_nx}x{self.mesh_ny}x{self.mesh_nz}/'
-                f'material_patch_{self.patch_idx}/material_patch/'
+                f'random_specimen_{self.patch_idx}/material_patch/'
                 f'material_patch_attributes.pkl')
 
         self.output_filename = (

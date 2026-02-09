@@ -9,97 +9,62 @@ import pstats
 
 from .elements import Element, Quad1, Quad2, Hexa1, Hexa2
 from .materials import Material
-from .operators import Operator, MechanicsOperator
 from .sparse import CachedSolve, sparse_solve
 
-# Optional imports for surrogate material models (graphorge)
-try:
-    import torch_geometric.data as pyg_data
-    from graphorge.gnn_base_model.model.gnn_model import (
-        GNNEPDBaseModel
-    )
-    from graphorge.gnn_base_model.data.graph_data import GraphData
-    from graphorge.projects.material_patches.gnn_model_tools.\
-        gen_graphs_files import (
-        get_elem_size_dims, get_mesh_connected_nodes
-    )
-    from graphorge.projects.material_patches.gnn_model_tools.\
-        features import GNNPatchFeaturesGenerator
-    from graphorge.gnn_base_model.model.custom_layers import (
-        compute_stiffness_matrix, extract_forces,
-        extract_displacements, compute_edge_features,
-        reconstruct_graph_with_displacements
-    )
-    GRAPHORGE_AVAILABLE = True
-except ImportError:
-    GRAPHORGE_AVAILABLE = False
-    GNNEPDBaseModel = None  # type: ignore
-
+import torch_geometric.data as pyg_data
+from graphorge.gnn_base_model.model.gnn_model import GNNEPDBaseModel
+from graphorge.gnn_base_model.data.graph_data import GraphData
+from graphorge.projects.material_patches.gnn_model_tools.gen_graphs_files \
+    import (get_elem_size_dims, get_mesh_connected_nodes)
+from graphorge.projects.material_patches.gnn_model_tools.features import (
+    GNNPatchFeaturesGenerator)
+from graphorge.gnn_base_model.model.custom_layers import (
+    compute_stiffness_matrix, extract_forces,
+    extract_displacements, compute_edge_features,
+    reconstruct_graph_with_displacements)
 import torch.func as torch_func
 import functools
 
 
 class FEM(ABC):
-    def __init__(
-        self,
-        nodes: Tensor,
-        elements: Tensor,
-        operator: Operator | Material
-    ):
+    def __init__(self, nodes: Tensor, elements: Tensor, material: Material):
         """Initialize a general finite element problem.
 
         Args:
             nodes (Tensor): Nodal coordinates of shape (n_nodes, n_dim).
             elements (Tensor): Element connectivity of shape
                 (n_elements, n_nodes_per_element).
-            operator (Operator | Material): Physics operator or legacy
-                Material. If Material provided, automatically wrapped in
-                MechanicsOperator.
+            material (Material): Material model instance.
 
         Note:
-            Automatically vectorizes non-vectorized operators for
-            efficient computation across all elements.
+            Automatically vectorizes non-vectorized materials for efficient
+            computation across all elements.
         """
         # Store nodes and elements
         self.nodes = nodes
         self.elements = elements
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Compute problem size
+        self.n_dofs = torch.numel(self.nodes)
         self.n_nod = nodes.shape[0]
         self.n_dim = nodes.shape[1]
         self.n_elem = len(self.elements)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Handle operator/material input first to get DOF structure
-        if isinstance(operator, Material):
-            # Wrap legacy Material in MechanicsOperator
-            operator = MechanicsOperator(operator)
-
-        # Vectorize operator
-        if operator.is_vectorized:
-            self.operator = operator
-        else:
-            self.operator = operator.vectorize(self.n_elem)
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Get DOF structure from operator
-        self.n_dof_per_node = self.operator.n_dof_per_node
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Compute problem size using operator's DOF structure
-        self.n_dofs = self.n_nod * self.n_dof_per_node
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Initialize field variables with correct shape
-        field_shape = (self.n_nod, self.n_dof_per_node)
-        self._source_term = torch.zeros(field_shape)
-        self._primary_field = torch.zeros(field_shape)
-        self._constraints = torch.zeros(field_shape, dtype=torch.bool)
+        # Initialize load variables
+        self._forces = torch.zeros_like(nodes)
+        self._displacements = torch.zeros_like(nodes)
+        self._constraints = torch.zeros_like(nodes, dtype=torch.bool)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Compute mapping from local to global indices
-        idx = (self.n_dof_per_node * self.elements).unsqueeze(-1) + \
-            torch.arange(self.n_dof_per_node)
+        idx = (self.n_dim * self.elements).unsqueeze(-1) + \
+            torch.arange(self.n_dim)
         self.idx = idx.reshape(self.n_elem, -1).to(torch.int32)
-
-        # Expose material property for backward compatibility
-        if isinstance(self.operator, MechanicsOperator):
-            self.material = self.operator.material
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Vectorize material
+        if material.is_vectorized:
+            self.material = material
         else:
-            self.material = None
+            self.material = material.vectorize(self.n_elem)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize types
         self.n_stress: int
@@ -112,43 +77,39 @@ class FEM(ABC):
     # -------------------------------------------------------------------------
     @property
     def forces(self) -> Tensor:
-        """Get nodal forces (mechanics) / source terms (diffusion).
+        """Get nodal forces.
 
         Returns:
-            Tensor: Source terms of shape (n_nodes, n_dim).
+            Tensor: Nodal forces of shape (n_nodes, n_dim).
         """
-        return self._source_term
+        return self._forces
     # -------------------------------------------------------------------------
     @forces.setter
     def forces(self, value: Tensor):
         """Set nodal forces with validation.
 
         Args:
-            value (Tensor): Nodal forces tensor of shape
-                (n_nodes, n_dof_per_node). Must be floating-point type.
+            value (Tensor): Nodal forces tensor of shape (n_nodes, n_dim).
+                Must be floating-point type.
 
         Raises:
-            ValueError: If shape doesn't match field structure.
+            ValueError: If shape doesn't match nodes.
             TypeError: If not floating-point type.
         """
-        expected_shape = (self.n_nod, self.n_dof_per_node)
-        if not value.shape == expected_shape:
-            raise ValueError(
-                f"Forces must have shape {expected_shape}, "
-                f"got {value.shape}"
-            )
+        if not value.shape == self.nodes.shape:
+            raise ValueError("Forces must have the same shape as nodes.")
         if not torch.is_floating_point(value):
             raise TypeError("Forces must be a floating-point tensor.")
-        self._source_term = value.to(self.nodes.device)
+        self._forces = value.to(self.nodes.device)
     # -------------------------------------------------------------------------
     @property
     def displacements(self) -> Tensor:
-        """Get nodal displacements (mechanics) / primary field (diffusion).
+        """Get nodal displacements.
 
         Returns:
-            Tensor: Primary field of shape (n_nodes, n_dim).
+            Tensor: Nodal displacements of shape (n_nodes, n_dim).
         """
-        return self._primary_field
+        return self._displacements
     # -------------------------------------------------------------------------
     @displacements.setter
     def displacements(self, value: Tensor):
@@ -156,23 +117,17 @@ class FEM(ABC):
 
         Args:
             value (Tensor): Nodal displacements tensor of shape
-                (n_nodes, n_dof_per_node). Must be floating-point type.
+                (n_nodes, n_dim). Must be floating-point type.
 
         Raises:
-            ValueError: If shape doesn't match field structure.
+            ValueError: If shape doesn't match nodes.
             TypeError: If not floating-point type.
         """
-        expected_shape = (self.n_nod, self.n_dof_per_node)
-        if not value.shape == expected_shape:
-            raise ValueError(
-                f"Displacements must have shape {expected_shape}, "
-                f"got {value.shape}"
-            )
+        if not value.shape == self.nodes.shape:
+            raise ValueError("Displacements must have the same shape as nodes.")
         if not torch.is_floating_point(value):
-            raise TypeError(
-                "Displacements must be a floating-point tensor."
-            )
-        self._primary_field = value.to(self.nodes.device)
+            raise TypeError("Displacements must be a floating-point tensor.")
+        self._displacements = value.to(self.nodes.device)
     # -------------------------------------------------------------------------
     @property
     def constraints(self) -> Tensor:
@@ -189,20 +144,15 @@ class FEM(ABC):
         """Set boundary condition constraints with validation.
 
         Args:
-            value (Tensor): Boolean tensor of shape
-                (n_nodes, n_dof_per_node) where True indicates constrained
-                degrees of freedom.
+            value (Tensor): Boolean tensor of shape (n_nodes, n_dim) where
+                True indicates constrained degrees of freedom.
 
         Raises:
-            ValueError: If shape doesn't match field structure.
+            ValueError: If shape doesn't match nodes.
             TypeError: If not boolean type.
         """
-        expected_shape = (self.n_nod, self.n_dof_per_node)
-        if not value.shape == expected_shape:
-            raise ValueError(
-                f"Constraints must have shape {expected_shape}, "
-                f"got {value.shape}"
-            )
+        if not value.shape == self.nodes.shape:
+            raise ValueError("Constraints must have the same shape as nodes.")
         if value.dtype != torch.bool:
             raise TypeError("Constraints must be a boolean tensor.")
         self._constraints = value.to(self.nodes.device)
@@ -261,15 +211,7 @@ class FEM(ABC):
     def compute_B(self) -> Tensor:
         """
         Compute null space matrix representing rigid body modes.
-
-        For scalar fields (diffusion), there are no rigid body modes.
-        Returns empty tensor for use with AMG preconditioner.
         """
-        # Scalar fields have no rigid body modes
-        if self.n_dof_per_node == 1:
-            return torch.zeros((self.n_dofs, 0))
-
-        # Vector fields (mechanics) have rigid body modes
         if self.n_dim == 3:
             B = torch.zeros((self.n_dofs, 6))
             B[0::3, 0] = 1
@@ -291,12 +233,12 @@ class FEM(ABC):
     # -------------------------------------------------------------------------
     def k0(self) -> Tensor:
         """Compute element stiffness matrix for zero strain.
-
+        
         Returns:
-            Tensor: Element stiffness matrices of shape (n_elem, n_dof_elem,
+            Tensor: Element stiffness matrices of shape (n_elem, n_dof_elem, 
                 n_dof_elem).
         """
-        u = torch.zeros(2, self.n_nod, self.n_dof_per_node)
+        u = torch.zeros_like(self.nodes)
         F = torch.zeros(2, self.n_int, self.n_elem, self.n_stress, 
                         self.n_stress)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -305,73 +247,59 @@ class FEM(ABC):
         s = torch.zeros(2, self.n_int, self.n_elem, self.n_stress, 
                         self.n_stress)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        a = torch.zeros(2, self.n_int, self.n_elem, self.operator.n_state)
-        du = torch.zeros(self.n_nod, self.n_dof_per_node)
+        a = torch.zeros(2, self.n_int, self.n_elem, self.material.n_state)
+        du = torch.zeros_like(self.nodes)
         de0 = torch.zeros(self.n_elem, self.n_stress, self.n_stress)
         self.K = torch.empty(0)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        k, _ = self.integrate_operator(u, F, s, a, 1, du.ravel(), de0, False)
+        k, _ = self.integrate_material(u, F, s, a, 1, du, de0, False)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return k
     # -------------------------------------------------------------------------
-    def integrate_operator(
+    def integrate_material(
         self,
         u: Tensor,
         F: Tensor,
-        flux: Tensor,
+        stress: Tensor,
         state: Tensor,
         n: int,
         du: Tensor,
-        external_inc: Tensor,
+        de0: Tensor,
         nlgeom: bool,
     ) -> Tuple[Tensor, Tensor]:
-        """Perform numerical integration for element matrices.
-
-        Generic integration supporting multiple PDE types through operator
-        interface. For mechanics: flux=stress, external_inc=thermal_strain.
-        For diffusion: flux=heat_flux, external_inc=source.
-
+        """Perform numerical integrations for element stiffness matrix.
+        
         Args:
-            u (Tensor): Primary field history (displacement, temperature)
-                of shape (n_increments, n_nodes, n_dim).
-            F (Tensor): Deformation measure history of shape
-                (n_increments, n_int, n_elem, n_stress, n_stress).
-                Identity for linear problems.
-            flux (Tensor): Flux history (stress, heat flux) of shape
-                (n_increments, n_int, n_elem, n_stress, n_stress).
-            state (Tensor): Operator state variable history of shape
+            u (Tensor): Displacement history of shape (n_increments, n_nodes, 
+                n_dim).
+            F (Tensor): Deformation gradient history of shape (n_increments, 
+                n_int, n_elem, n_stress, n_stress).
+            stress (Tensor): Stress history of shape (n_increments, n_int, 
+                n_elem, n_stress, n_stress).
+            state (Tensor): Material state variable history of shape 
                 (n_increments, n_int, n_elem, n_state).
             n (int): Current increment number.
-            du (Tensor): Primary field increment vector of shape (n_dofs,).
-            external_inc (Tensor): External gradient increment (thermal
-                strain, source) of shape (n_elem, n_stress, n_stress).
-            nlgeom (bool): Whether to use nonlinear geometry (mechanics
-                only).
-
+            du (Tensor): Displacement increment vector of shape (n_dofs,).
+            de0 (Tensor): External strain increment of shape (n_elem, 
+                n_stress, n_stress).
+            nlgeom (bool): Whether to use nonlinear geometry.
+            
         Returns:
-            Tuple[Tensor, Tensor]: Element stiffness matrices of shape
-                (n_elem, n_dof_elem, n_dof_elem) and internal force
-                vectors of shape (n_elem, n_dof_elem).
+            Tuple[Tensor, Tensor]: Element stiffness matrices of shape 
+                (n_elem, n_dof_elem, n_dof_elem) and internal force vectors
+                of shape (n_elem, n_dof_elem).
         """
         # Compute updated configuration
-        u_trial = u[n - 1] + du.view((-1, self.n_dof_per_node))
+        u_trial = u[n - 1] + du.view((-1, self.n_dim))
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Reshape field increment to element-wise
-        # Shape: (n_nodes, n_dof_per_node) -> (n_elem, n_nod_per_elem,
-        # n_dof_per_node)
-        du_field = du.view(-1, self.n_dof_per_node)[self.elements]
+        # Reshape displacement increment
+        du = du.view(-1, self.n_dim)[self.elements].reshape(
+            self.n_elem, -1, self.n_stress)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize nodal force and stiffness
         n_nod = self.etype.nodes
-        n_dof_elem = self.n_dof_per_node * n_nod
-
-        # For scalar fields, forces can be computed more efficiently
-        if self.n_dof_per_node == 1:
-            f = torch.zeros(self.n_elem, n_nod)
-        else:
-            f = torch.zeros(self.n_elem, n_dof_elem)
-
-        k = torch.zeros((self.n_elem, n_dof_elem, n_dof_elem))
+        f = torch.zeros(self.n_elem, self.n_dim * n_nod)
+        k = torch.zeros((self.n_elem, self.n_dim * n_nod, self.n_dim * n_nod))
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         for i, (w, xi) in enumerate(zip(self.etype.iweights(), 
                                         self.etype.ipoints())):
@@ -385,79 +313,31 @@ class FEM(ABC):
                 B = B0
                 detJ = detJ0
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Compute gradient using operator-specific method
-            gradient_inc = self.operator.compute_element_gradient(
-                du_field, B0
-            )
-
-            # For mechanics compatibility, wrap gradient in tensor form
-            # Mechanics: gradient_inc already (n_elem, n_dim, n_dim)
-            # Diffusion: gradient_inc is (n_elem, n_dim), wrap as diagonal
-            if gradient_inc.dim() == 2:
-                # Scalar field: embed as diagonal of (n_dim, n_dim)
-                gradient_inc = torch.diag_embed(gradient_inc)
-
+            # Compute displacement gradient increment
+            H_inc = torch.einsum("...ij,...jk->...ik", B0, du)
             # Update deformation gradient
-            F[n, i] = F[n - 1, i] + gradient_inc
+            F[n, i] = F[n - 1, i] + H_inc
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Evaluate operator response (stress for mechanics, heat flux
-            # for diffusion, etc.)
-            flux[n, i], state[n, i], tangent = self.operator.evaluate(
-                gradient_inc, F[n - 1, i], flux[n - 1, i], state[n - 1, i],
-                external_inc
-            )
+            # Evaluate material response
+            stress[n, i], state[n, i], ddsdde = self.material.step(
+                H_inc, F[n - 1, i], stress[n - 1, i], state[n - 1, i], de0)
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Compute element internal forces (divergence of flux)
-            force_contrib = self.compute_f(detJ, B, flux[n, i].clone())
-
-            # Reshape based on field structure
-            # force_contrib has shape (n_elem, n_nodes, n_dim)
-            if self.n_dof_per_node == 1:
-                # Scalar field: extract only first component
-                # (others are zero from diagonal flux tensor)
-                force_contrib = force_contrib[:, :, 0]
-                # Now shape is (n_elem, n_nodes)
-                f += w * force_contrib
-            else:
-                # Vector field: reshape to (n_elem, n_nodes * n_dof_per_node)
-                f += w * force_contrib.reshape(-1,
-                                               n_nod * self.n_dof_per_node)
+            # Compute element internal forces
+            force_contrib = self.compute_f(detJ, B, stress[n, i].clone())
+            f += w * force_contrib.reshape(-1, self.n_dim * n_nod)
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute element stiffness matrix
-            if self.K.numel() == 0 or not self.operator.n_state == 0 or nlgeom:
-                # Assemble using operator-specific method
-                K_elem = self.operator.assemble_element_stiffness(
-                    B, tangent, detJ, w
-                )
-
-                # Reshape to (n_elem, n_dof_per_node*n_nod,
-                # n_dof_per_node*n_nod)
-                if K_elem.dim() == 3:
-                    # Scalar field: (n_elem, n_nod, n_nod) -> expand to
-                    # match vector field
-                    # Each node has n_dof_per_node DOFs
-                    K_elem_expanded = torch.zeros(
-                        self.n_elem, self.n_dof_per_node * n_nod,
-                        self.n_dof_per_node * n_nod
-                    )
-                    for dof in range(self.n_dof_per_node):
-                        idx = torch.arange(n_nod) * self.n_dof_per_node + dof
-                        K_elem_expanded[:, idx[:, None], idx[None, :]] = \
-                            K_elem
-                    K_elem = K_elem_expanded
-                else:
-                    # Vector field: already correct shape, just reshape
-                    K_elem = K_elem.reshape(
-                        -1, self.n_dof_per_node * n_nod,
-                        self.n_dof_per_node * n_nod
-                    )
-
-                k += K_elem
+            if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
+                # Material stiffness
+                BCB = torch.einsum(
+                    "...ijpq,...qk,...il->...ljkp", ddsdde, B, B)
+                BCB = BCB.reshape(-1, self.n_dim * n_nod, self.n_dim * n_nod)
+                k += w * self.compute_k(detJ, BCB)
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             if nlgeom:
-                # Geometric stiffness (mechanics only)
+                # Geometric stiffness
                 BSB = torch.einsum(
-                    "...iq,...qk,...il->...lk", flux[n, i].clone(), B, B
+                    "...iq,...qk,...il->...lk", stress[n, i].clone(), B, B
                 )
                 zeros = torch.zeros_like(BSB)
                 kg = torch.stack([BSB] + (self.n_dim - 1) * [zeros], dim=-1)
@@ -469,30 +349,25 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return k, f
     # ------------------------------------------------------------------------- 
-    def _load_Graphorge_model(self, model_directory: str,
+    def _load_Graphorge_model(self, model_directory: str, 
                               device_type: str = 'cpu'):
         """Load and configure Graphorge material patch model.
-
+        
         Args:
-            model_directory (str): Path to the directory containing the trained
+            model_directory (str): Path to the directory containing the trained 
                 Graphorge model files.
-            device_type (str, optional): Device type for model execution
+            device_type (str, optional): Device type for model execution 
                 ('cpu' or 'cuda'). Defaults to 'cpu'.
-
+                
         Returns:
-            GNNEPDBaseModel: Loaded and configured Graphorge model ready for
+            GNNEPDBaseModel: Loaded and configured Graphorge model ready for 
                 inference with material patch predictions.
-
+                
         Example:
             >>> model = fem_instance._load_Graphorge_model(
             ...     model_directory='/path/to/trained/model',
             ...     device_type='cpu')
-        """
-        if not GRAPHORGE_AVAILABLE:
-            raise ImportError(
-                "Graphorge not available. Install graphorge package "
-                "to use surrogate material models."
-            )
+        """     
         # Initialize model from directory
         model = GNNEPDBaseModel.init_model_from_file(model_directory)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -505,6 +380,11 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Set to evaluation mode
         model.eval()
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Deactivate equilibrium layers (incompatible with
+        # jacfwd dual numbers in pinv)
+        # model._is_force_moment_equilibrium = False
+        # model._is_force_equilibrium = False
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return model
     # -------------------------------------------------------------------------  
@@ -604,6 +484,51 @@ class FEM(ABC):
 
         return F.index_add_(0, indices, values)
     # -------------------------------------------------------------------------
+    def _apply_constraints_sparse(self, K, con):
+        """Eliminate constrained DOFs from sparse K.
+
+        Removes entries in constrained rows/columns and
+        adds identity diagonal entries for constrained
+        DOFs. Mirrors the constraint logic in
+        assemble_stiffness.
+
+        Parameters
+        ----------
+        K : torch.sparse_coo_tensor
+            Global stiffness matrix in COO format.
+        con : torch.Tensor
+            Indices of constrained DOFs.
+
+        Returns
+        -------
+        K_con : torch.sparse_coo_tensor
+            Stiffness matrix with constraints applied.
+        """
+        K = K.coalesce()
+        indices = K.indices()
+        values = K.values()
+        rows = indices[0]
+        cols = indices[1]
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Mask out constrained rows and columns
+        mask_row = torch.isin(rows, con)
+        mask_col = torch.isin(cols, con)
+        mask = ~(mask_row | mask_col)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Identity diagonal for constrained DOFs
+        diag_idx = torch.stack((con, con), dim=0)
+        diag_val = torch.ones(
+            len(con), dtype=values.dtype)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Rebuild sparse tensor
+        new_indices = torch.cat(
+            (indices[:, mask], diag_idx), dim=1)
+        new_values = torch.cat(
+            (values[mask], diag_val), dim=0)
+        return torch.sparse_coo_tensor(
+            new_indices, new_values, K.shape
+        ).coalesce()
+    # -------------------------------------------------------------------------
     def solve(
         self,
         increments: Tensor = torch.tensor([0.0, 1.0]),
@@ -624,40 +549,38 @@ class FEM(ABC):
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict]:
-        """Solve the FEM problem with Newton-Raphson method.
-
-        Generic solver supporting multiple PDE types via operator interface.
-        For mechanics: returns (displacements, forces, stress, defgrad, state).
-        For diffusion: returns (temperature, fluxes, heat_flux, identity, state).
+        """Solve the FEM problem with the Newton-Raphson method.
 
         Args:
-            increments (Tensor): Load/field increment stepping.
-            max_iter (int): Maximum Newton-Raphson iterations.
-            rtol (float): Relative tolerance for convergence.
-            atol (float): Absolute tolerance for convergence.
+            increments (Tensor): Load increment stepping.
+            max_iter (int): Maximum number of iterations during Newton-Raphson.
+            rtol (float): Relative tolerance for Newton-Raphson convergence.
+            atol (float): Absolute tolerance for Newton-Raphson convergence.
             stol (float): Solver tolerance for iterative methods.
             verbose (bool): Print iteration information.
-            method (str): Linear solve method
+            method (str): Method for linear solve 
                 ('spsolve','minres','cg','pardiso').
-            device (str): Device for linear solve.
-            return_intermediate (bool): Return full history if True.
-            aggregate_integration_points (bool): Average integration
+            device (str): Device to run the linear solve on.
+            return_intermediate (bool): Return intermediate values if True.
+            aggregate_integration_points (bool): Aggregate integration 
                 points if True.
-            use_cached_solve (bool): Use cached factorization.
-            nlgeom (bool): Use nonlinear geometry (mechanics only).
-            return_volumes (bool): Return element volumes.
-            return_resnorm (bool): Return residual norm history.
+            use_cached_solve (bool): Use cached solve, e.g. in topology 
+                optimization.
+            nlgeom (bool): Use nonlinear geometry if True.
+            return_volumes (bool): Return element volumes for each 
+                increment if True.
+            return_resnorm (bool): Return residual norm history for each 
+                increment if True.
 
         Returns:
-            Tuple containing:
-                - u: Primary field (displacements, temperature)
-                - f: Internal forces (mechanics) / fluxes (diffusion)
-                - flux: Generalized flux (stress, heat flux)
-                - deformation: Deformation measure (F for mechanics,
-                    identity for diffusion)
-                - state: Operator internal state
-                - volumes (optional): Element volumes
-                - residual_history (optional): Convergence history
+                Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: Final 
+                    displacements,
+                    internal forces, stress, deformation gradient, and 
+                    material state.
+                If return_volumes=True, also returns element volumes with shape
+                (num_increments, num_elem, 1).
+                If return_resnorm=True, also returns residual history dict with
+                increment numbers as keys and lists of residual norms as values.
 
         """
         # Number of increments
@@ -670,14 +593,14 @@ class FEM(ABC):
         con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize variables to be computed
-        u = torch.zeros(N, self.n_nod, self.n_dof_per_node)
-        f = torch.zeros(N, self.n_nod, self.n_dof_per_node)
+        u = torch.zeros(N, self.n_nod, self.n_dim)
+        f = torch.zeros(N, self.n_nod, self.n_dim)
         stress = torch.zeros(N, self.n_int, self.n_elem,
                              self.n_stress, self.n_stress)
         defgrad = torch.zeros(N, self.n_int, self.n_elem,
                               self.n_stress, self.n_stress)
         defgrad[:, :, :, :, :] = torch.eye(self.n_stress)
-        state = torch.zeros(N, self.n_int, self.n_elem, self.operator.n_state)
+        state = torch.zeros(N, self.n_int, self.n_elem, self.material.n_state)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize volumes if requested
         if return_volumes:
@@ -694,7 +617,7 @@ class FEM(ABC):
         self.K = torch.empty(0)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize displacement increment
-        du = torch.zeros(self.n_nod, self.n_dof_per_node).ravel()
+        du = torch.zeros_like(self.nodes).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Incremental loading
         for n in range(1, N):
@@ -715,14 +638,14 @@ class FEM(ABC):
                 # Element-wise integration
                 # profiler = cProfile.Profile()
                 # profiler.enable()
-                k, f_i = self.integrate_operator(
+                k, f_i = self.integrate_material(
                     u, defgrad, stress, state, n, du, de0, nlgeom
                 )
                 # profiler.disable()
                 # print(f"\n=== integrate_material PROFILE (increment {n}) ===")
                 # stats = pstats.Stats(profiler)
                 # stats.sort_stats('cumulative').print_stats(10)
-                if self.K.numel() == 0 or not self.operator.n_state == 0 or \
+                if self.K.numel() == 0 or not self.material.n_state == 0 or \
                     nlgeom:
                     self.K = self.assemble_stiffness(k, con)
                 F_int = self.assemble_force(f_i)
@@ -774,8 +697,8 @@ class FEM(ABC):
                 raise Exception("Newton-Raphson iteration did not converge.")
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Update increment
-            f[n] = F_int.reshape((-1, self.n_dof_per_node))
-            u[n] = u[n - 1] + du.reshape((-1, self.n_dof_per_node))
+            f[n] = F_int.reshape((-1, self.n_dim))
+            u[n] = u[n - 1] + du.reshape((-1, self.n_dim))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute element volumes if requested
             if return_volumes:
@@ -804,76 +727,6 @@ class FEM(ABC):
             result.append(residual_history)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return tuple(result)
-    # -------------------------------------------------------------------------
-    def solve_forward(
-        self,
-        stol: float = 1e-10,
-        verbose: bool = False,
-        method: Literal["spsolve", "minres", "cg", "pardiso"] | None = None,
-        device: str | None = None,
-    ) -> Tuple[Tensor, Tensor]:
-        """
-        Direct forward solve for linear problems: K·u = F.
-
-        For linear steady-state problems (Laplace, Poisson, linear elasticity),
-        directly solves the system without Newton-Raphson iteration.
-
-        Args:
-            stol: Solver tolerance for iterative methods.
-            verbose: Print solve information.
-            method: Linear solve method
-                ('spsolve','minres','cg','pardiso').
-            device: Device for linear solve.
-
-        Returns:
-            Tuple containing:
-                - u: Primary field solution (n_nodes, n_dof_per_node)
-                - f: Internal forces (n_nodes, n_dof_per_node)
-        """
-        if verbose:
-            print("Direct forward solve for linear problem")
-
-        # Null space rigid body modes for AMG preconditioner
-        B = self.compute_B()
-
-        # Constrained DOFs
-        con = torch.nonzero(
-            self.constraints.ravel(), as_tuple=False
-        ).ravel()
-
-        # Compute stiffness matrix K for zero strain
-        k_elem = self.k0()
-        self.K = self.assemble_stiffness(k_elem, con)
-
-        # External force vector
-        F_ext = self.forces.ravel()
-
-        # Apply displacement constraints
-        du = torch.zeros(self.n_nod, self.n_dof_per_node).ravel()
-        du[con] = self.displacements.ravel()[con]
-
-        # Solve K·u = F
-        du = sparse_solve(
-            self.K, F_ext, B, stol, device, method, None,
-            CachedSolve(), False
-        )
-
-        # Apply constraints
-        du[con] = self.displacements.ravel()[con]
-
-        # Reshape to field structure
-        u = du.reshape((-1, self.n_dof_per_node))
-
-        # Compute internal forces: F_int = K·u
-        F_int = torch.sparse.mm(
-            self.K.to_sparse_csr(), du.unsqueeze(1)
-        ).squeeze()
-        f = F_int.reshape((-1, self.n_dof_per_node))
-
-        if verbose:
-            print(f"Solution complete: {self.n_dofs} DOFs solved")
-
-        return u, f
     # -------------------------------------------------------------------------
     def integrate_material_msc(
         self,
@@ -942,7 +795,7 @@ class FEM(ABC):
             # Compute displacement gradient increment
             H_inc = torch.einsum("...ij,...jk->...ik", B0, du)
             # Update deformation gradient
-            F[n, i] = F[n - 1, i] + H_inc
+            # F[n, i] = F[n - 1, i] + H_inc
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute increment strain tensor from displacement gradient
             # For small strain: epsilon = 0.5*(H + H^T)
@@ -985,39 +838,40 @@ class FEM(ABC):
             # Reorder denormalized stress to torch-fem order
             sigma_torchfem = torch.zeros(self.n_elem, 6)
             sigma_torchfem[:, 0] = (sigma_denorm[:, 1] + 
-                                     sigma_denorm[:, 0])  # s11
-            sigma_torchfem[:, 1] = sigma_denorm[:, 3]  # s12
+                                     sigma_denorm[:, 0])  # sigma_11
+            sigma_torchfem[:, 1] = sigma_denorm[:, 3]  # sigma_12
             if self.n_dim == 3:
-                sigma_torchfem[:, 2] = sigma_denorm[:, 4]  # s13
+                sigma_torchfem[:, 2] = sigma_denorm[:, 4]  # sigma_13
                 sigma_torchfem[:, 3] = (sigma_denorm[:, 2] + 
-                                         sigma_denorm[:, 0])  # s22
-                sigma_torchfem[:, 4] = sigma_denorm[:, 5]  # s23
+                                         sigma_denorm[:, 0])  # sigma_22
+                sigma_torchfem[:, 4] = sigma_denorm[:, 5]  # sigma_23
                 sigma_torchfem[:, 5] = (3*sigma_denorm[:, 0] - 
                                          sigma_torchfem[:, 0] - 
-                                         sigma_torchfem[:, 3])  # s33
+                                         sigma_torchfem[:, 3])  # sigma_33
             else:
                 sigma_torchfem[:, 2] = (sigma_denorm[:, 2] + 
-                                         sigma_denorm[:, 0])  # s22
+                                         sigma_denorm[:, 0])  # sigma_22
             breakpoint()
             # Update stress tensor for this integration point
             if self.n_dim == 3:
-                stress[n, i, :, 0, 0] = sigma_torchfem[:, 0]  # s11
-                stress[n, i, :, 0, 1] = sigma_torchfem[:, 1]  # s12
-                stress[n, i, :, 0, 2] = sigma_torchfem[:, 2]  # s13
-                stress[n, i, :, 1, 0] = sigma_torchfem[:, 1]  # s21
-                stress[n, i, :, 1, 1] = sigma_torchfem[:, 3]  # s22
-                stress[n, i, :, 1, 2] = sigma_torchfem[:, 4]  # s23
-                stress[n, i, :, 2, 0] = sigma_torchfem[:, 2]  # s31
-                stress[n, i, :, 2, 1] = sigma_torchfem[:, 4]  # s32
-                stress[n, i, :, 2, 2] = sigma_torchfem[:, 5]  # s33
+                stress[n, i, :, 0, 0] = sigma_torchfem[:, 0]  # sigma_11
+                stress[n, i, :, 0, 1] = sigma_torchfem[:, 1]  # sigma_12
+                stress[n, i, :, 0, 2] = sigma_torchfem[:, 2]  # sigma_13
+                stress[n, i, :, 1, 0] = sigma_torchfem[:, 1]  # sigma_21
+                stress[n, i, :, 1, 1] = sigma_torchfem[:, 3]  # sigma_22
+                stress[n, i, :, 1, 2] = sigma_torchfem[:, 4]  # sigma_23
+                stress[n, i, :, 2, 0] = sigma_torchfem[:, 2]  # sigma_31
+                stress[n, i, :, 2, 1] = sigma_torchfem[:, 4]  # sigma_32
+                stress[n, i, :, 2, 2] = sigma_torchfem[:, 5]  # sigma_33
             else:
-                stress[n, i, :, 0, 0] = sigma_torchfem[:, 0]  # s11
-                stress[n, i, :, 0, 1] = sigma_torchfem[:, 1]  # s12
-                stress[n, i, :, 1, 0] = sigma_torchfem[:, 1]  # s21
-                stress[n, i, :, 1, 1] = sigma_torchfem[:, 2]  # s22
+                stress[n, i, :, 0, 0] = sigma_torchfem[:, 0]  # sigma_11
+                stress[n, i, :, 0, 1] = sigma_torchfem[:, 1]  # sigma_12
+                stress[n, i, :, 1, 0] = sigma_torchfem[:, 1]  # sigma_21
+                stress[n, i, :, 1, 1] = sigma_torchfem[:, 2]  # sigma_22
             
             # Compute ddsdde via autograd as 4th-order tensor
-            # ddsdde[e,i_idx,j_idx,k,l] = ∂σ_ij/∂ε_kl
+            # ddsdde[e,i_idx,j_idx,k,l] = 
+            # \partial sigma__ij/\partial \varepsilon_kl
             ddsdde = torch.zeros(self.n_elem, 3, 3, 3, 3)
             for i_idx in range(3):
                 for j_idx in range(3):
@@ -1036,19 +890,21 @@ class FEM(ABC):
             # Compute element internal forces
             force_contrib = self.compute_f(detJ, B, stress[n, i].clone())
             f += w * force_contrib.reshape(-1, self.n_dim * n_nod)
+            breakpoint()
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute element stiffness matrix
-            if self.K.numel() == 0 or not self.operator.n_state == 0 or nlgeom:
-                # Tangent stiffness (material/conductivity)
+            if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
+                # Material stiffness
                 BCB = torch.einsum(
-                    "...ijpq,...qk,...il->...ljkp", tangent, B, B)
+                    "...ijpq,...qk,...il->...ljkp", ddsdde, B, B)
                 BCB = BCB.reshape(-1, self.n_dim * n_nod, self.n_dim * n_nod)
                 k += w * self.compute_k(detJ, BCB)
+            breakpoint()
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             if nlgeom:
-                # Geometric stiffness (mechanics only)
+                # Geometric stiffness
                 BSB = torch.einsum(
-                    "...iq,...qk,...il->...lk", flux[n, i].clone(), B, B
+                    "...iq,...qk,...il->...lk", stress[n, i].clone(), B, B
                 )
                 zeros = torch.zeros_like(BSB)
                 kg = torch.stack([BSB] + (self.n_dim - 1) * [zeros], dim=-1)
@@ -1136,8 +992,8 @@ class FEM(ABC):
         con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize variables to be computed
-        u = torch.zeros(N, self.n_nod, self.n_dof_per_node)
-        f = torch.zeros(N, self.n_nod, self.n_dof_per_node)
+        u = torch.zeros(N, self.n_nod, self.n_dim)
+        f = torch.zeros(N, self.n_nod, self.n_dim)
         stress = torch.zeros(N, self.n_int, self.n_elem,
                              self.n_stress, self.n_stress)
         defgrad = torch.zeros(N, self.n_int, self.n_elem,
@@ -1160,7 +1016,7 @@ class FEM(ABC):
         self.K = torch.empty(0)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize displacement increment
-        du = torch.zeros(self.n_nod, self.n_dof_per_node).ravel()
+        du = torch.zeros_like(self.nodes).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Incremental loading
         for n in range(1, N):
@@ -1191,6 +1047,7 @@ class FEM(ABC):
                 residual = F_int - F_ext
                 residual[con] = 0.0
                 res_norm = torch.linalg.norm(residual)
+                breakpoint()
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Save residual norm to history if requested
                 if return_resnorm:
@@ -1226,16 +1083,15 @@ class FEM(ABC):
                     method,
                     None,
                     cached_solve,
-                    update_cache,
-                )
+                    update_cache,)
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Check convergence
             if res_norm > rtol * res_norm0 and res_norm > atol:
                 raise Exception("Newton-Raphson iteration did not converge.")
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Update increment
-            f[n] = F_int.reshape((-1, self.n_dof_per_node))
-            u[n] = u[n - 1] + du.reshape((-1, self.n_dof_per_node))
+            f[n] = F_int.reshape((-1, self.n_dim))
+            u[n] = u[n - 1] + du.reshape((-1, self.n_dim))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute element volumes if requested
             if return_volumes:
@@ -1265,80 +1121,65 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return tuple(result)
     # -------------------------------------------------------------------------
-    def _build_graph_topology(self, patch_id: int):
+    def _build_graph_topology(self, patch_id: int, patch_elem_per_dim=None):
         """Build and store graph topology for a material patch.
 
         Args:
             patch_id (int): Material patch identifier.
+            patch_elem_per_dim (list): Number of elements per dimension in
+                the patch, e.g., [2, 2] for 2x2 patch. Defaults to [1, 1].
         """
-        # Get material patch nodes
-        elem_nodes = self.elements[patch_id]
-        elem_coords_ref = self.nodes[elem_nodes]
-        node_coords_init = elem_coords_ref.detach().numpy()
+        # Get material patch boundary nodes
+        boundary_node_ids = self.patch_bd_nodes[patch_id]
+        boundary_coords_ref = self.nodes[boundary_node_ids]
+        node_coords_init = boundary_coords_ref.detach().numpy()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Extract data in format expected by Graphorge - patch dimensions
+        # Extract patch dimensions from bounding box of boundary coordinates
         dim = self.n_dim
-        if dim == 2:
-            patch_dim = [1.0, 1.0]
-            n_elem_per_dim = [1, 1]
-        elif dim == 3:
-            patch_dim = [1.0, 1.0, 1.0]
-            n_elem_per_dim = [1, 1, 1]
+        coords_min = boundary_coords_ref.min(dim=0).values
+        coords_max = boundary_coords_ref.max(dim=0).values
+        patch_dim_tensor = coords_max - coords_min
+        patch_dim = patch_dim_tensor.tolist()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Create mesh matrix for single-element material patch
-        if isinstance(self.etype, Quad1):
-            elem_order = 1
-            # mesh_nodes_matrix = np.array([[0, 1], [2, 3]])
-        elif isinstance(self.etype, Quad2):
-            elem_order = 2
-        # Initialize mesh_nodes_matrix
-        mesh_nx = mesh_ny = mesh_nz = 1
+        # Set elements per dimension from parameter or default to [1, 1] / [1]
+        if patch_elem_per_dim is None:
+            if dim == 2:
+                n_elem_per_dim = [1, 1]
+            elif dim == 3:
+                n_elem_per_dim = [1, 1, 1]
+        else:
+            n_elem_per_dim = patch_elem_per_dim
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Material patches always use Quad4 (linear) elements
+        elem_order = 1
+        # Set mesh dimensions from n_elem_per_dim
+        mesh_nx = n_elem_per_dim[0]
+        mesh_ny = n_elem_per_dim[1]
+        mesh_nz = n_elem_per_dim[2] if dim == 3 else 1
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Build mesh_nodes_matrix for Quad4-based patches
+        # For a patch with mesh_nx x mesh_ny elements, the boundary nodes
+        # form a (mesh_nx+1) x (mesh_ny+1) grid, but we only keep boundary
         n_nod = self.etype.nodes
         if dim == 2:
-            if elem_order == 1:
-                # Linear elements:
-                # (mesh_nx+1)x(mesh_ny+1) nodes
-                mesh_nodes_matrix = np.zeros(
-                    (mesh_nx + 1, mesh_ny + 1), dtype=int)
-                node_idx = 0
-                for i in range(mesh_nx + 1):
-                    for j in range(mesh_ny + 1):
-                        mesh_nodes_matrix[i, j] = node_idx
-                        node_idx += 1
-            else:  # elem_order == 2
-                # Quadratic elements:
-                # (2*mesh_nx+1)x(2*mesh_ny+1) nodes
-                mesh_nodes_matrix = np.zeros(
-                    (2*mesh_nx + 1, 2*mesh_ny + 1), dtype=int)
-                node_idx = 0
-                for i in range(2*mesh_nx + 1):
-                    for j in range(2*mesh_ny + 1):
-                        mesh_nodes_matrix[i, j] = node_idx
-                        node_idx += 1     
+            # Linear elements: (mesh_nx+1)x(mesh_ny+1) nodes
+            mesh_nodes_matrix = np.zeros(
+                (mesh_nx + 1, mesh_ny + 1), dtype=int)
+            node_idx = 0
+            for i in range(mesh_nx + 1):
+                for j in range(mesh_ny + 1):
+                    mesh_nodes_matrix[i, j] = node_idx
+                    node_idx += 1
         elif dim == 3:
-            if elem_order == 1:
-                # Linear elements:
-                # (mesh_nx+1)x(mesh_ny+1)x(mesh_nz+1) nodes
-                mesh_nodes_matrix = np.zeros(
-                    (mesh_nx + 1, mesh_ny + 1, mesh_nz + 1), dtype=int)
-                node_idx = 0
-                for i in range(mesh_nx + 1):
-                    for j in range(mesh_ny + 1):
-                        for k in range(mesh_nz + 1):
-                            mesh_nodes_matrix[i, j, k] = node_idx
-                            node_idx += 1
-            else:  # elem_order == 2
-                # Quadratic elements:
-                # (2*mesh_nx+1)x(2*mesh_ny+1)x(2*mesh_nz+1) nodes
-                mesh_nodes_matrix = np.zeros(
-                    (2*mesh_nx + 1, 2*mesh_ny + 1, 2*mesh_nz + 1),
-                    dtype=int)
-                node_idx = 0
-                for i in range(2*mesh_nx + 1):
-                    for j in range(2*mesh_ny + 1):
-                        for k in range(2*mesh_nz + 1):
-                            mesh_nodes_matrix[i, j, k] = node_idx
-                            node_idx += 1
+            # Linear elements: (mesh_nx+1)x(mesh_ny+1)x(mesh_nz+1) nodes
+            mesh_nodes_matrix = np.zeros(
+                (mesh_nx + 1, mesh_ny + 1, mesh_nz + 1), dtype=int)
+            node_idx = 0
+            for i in range(mesh_nx + 1):
+                for j in range(mesh_ny + 1):
+                    for k in range(mesh_nz + 1):
+                        mesh_nodes_matrix[i, j, k] = node_idx
+                        node_idx += 1
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Instantiate GNN-based material patch graph data
         gnn_patch_data = GraphData(
@@ -1349,12 +1190,16 @@ class FEM(ABC):
             get_elem_size_dims(patch_dim, n_elem_per_dim, dim)]))
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Get boundary node information
-        # Note: for single element all nodes are boundary nodes
-        bd_node_indices = list(range(n_nod))
+        n_boundary = len(boundary_node_ids)
+        bd_node_indices = list(range(n_boundary))
         boundary_node_set = set(bd_node_indices)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # # OLD: for single element all nodes are boundary nodes
+        # bd_node_indices = list(range(n_nod))
+        # boundary_node_set = set(bd_node_indices)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Create mapping from original to boundary indices
-        original_to_boundary_idx = {node_id: position for position, 
+        original_to_boundary_idx = {node_id: position for position,
                                     node_id in enumerate(bd_node_indices)}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Get finite element mesh edges for all nodes
@@ -1393,34 +1238,35 @@ class FEM(ABC):
         hidden_states: dict = None,
     ) -> Tuple[Tensor, Tensor]:
         """Perform surrogate integration using Graphorge material patch model.
-        
+
         Args:
-            model (GNNEPDBaseModel): Pre-loaded Graphorge material patch model 
+            model (GNNEPDBaseModel): Pre-loaded Graphorge material patch model
                 configured for inference.
-            u (Tensor): Displacement history tensor of shape (n_increments, 
-                n_nodes, n_dim). Only current displacement u[n] is used for 
+            u (Tensor): Displacement history tensor of shape (n_increments,
+                n_nodes, n_dim). Only current displacement u[n] is used for
                 graph construction.
             n (int): Current increment number (0-indexed).
-            du (Tensor): Displacement increment tensor of shape (n_dofs,). 
+            du (Tensor): Displacement increment tensor of shape (n_dofs,).
                 Used to update current displacement configuration.
-            is_stepwise (bool): Whether to use stepwise RNN mode with 
+            is_stepwise (bool): Whether to use stepwise RNN mode with
                 hidden state tracking between steps. Defaults to False.
-            
+            patch_ids (Tensor): Patch IDs to process.
+            hidden_states (dict): Hidden states for RNN mode.
+
         Returns:
             Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, dict]: A tuple
                 containing:
-                - k (Tensor): Element stiffness matrices of shape (n_elem,
-                  n_dof_elem, n_dof_elem).
-                - f (Tensor): Element internal force vectors of shape (n_elem,
-                  n_dof_elem).
+                - K_global (Tensor): Global stiffness matrix (sparse COO)
+                  of shape (n_dof_global, n_dof_global).
+                - F_global (Tensor): Global internal force vector of shape
+                  (n_dof_global,).
                 - hidden_states_out (dict, optional): Updated hidden states
                   for each patch (only returned in stepwise mode).
-                  
+
         Note:
-            This method constructs graphs using only the current step 
-            displacement and coordinates (single-step approach), regardless of 
-            the mode. The distinction between stepwise and non-stepwise modes 
-            affects only how the GNN model processes the graph data internally.
+            This method constructs graphs using only boundary nodes of each
+            patch. Internal nodes are constrained to zero displacement and do
+            not contribute to stiffness or forces.
         """
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize patch-specific hidden states output
@@ -1429,31 +1275,50 @@ class FEM(ABC):
         # Update current displacement
         u[n] = u[n - 1] + du.view((-1, self.n_dim))
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Initialize nodal force and stiffness
-        n_nod = self.etype.nodes
-        n_dof_elem = self.n_dim * n_nod
-        f = torch.zeros(self.n_elem, n_dof_elem)
-        k = torch.zeros((self.n_elem, n_dof_elem, n_dof_elem))
+        # Initialize global force and stiffness assembly
+        n_dof_global = self.n_nod * self.n_dim
+        F_global = torch.zeros(n_dof_global)
+
+        # Sparse stiffness assembly (COO format)
+        k_indices = []
+        k_values = []
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Determine which elements to process based on patch_ids
+        # # OLD: Initialize nodal force and stiffness
+        # n_nod = self.etype.nodes
+        # n_dof_elem = self.n_dim * n_nod
+        # f = torch.zeros(self.n_elem, n_dof_elem)
+        # k = torch.zeros((self.n_elem, n_dof_elem, n_dof_elem))
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Determine which patches to process based on patch_ids
         if patch_ids is not None:
             # patch_ids contains the actual patch IDs to process
             # Convert to list for iteration
             patch_indices = patch_ids.tolist()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Loop over element indices
+        # Loop over patches
         for idx_patch in patch_indices:
             # Get patch identifier for stepwise mode
             patch_id = f"patch_{idx_patch}"
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Get material patch nodes
-            elem_nodes = self.elements[idx_patch]  
-            # Current displacement at increment n
-            elem_u_current = u[n, elem_nodes, :].clone()
-            # Extract material patch nodal coordinates
-            elem_coords_ref = self.nodes[elem_nodes]
+            # Get material patch boundary nodes
+            boundary_node_ids = self.patch_bd_nodes[idx_patch]
+            n_boundary = len(boundary_node_ids)
+            n_dof_boundary = n_boundary * self.n_dim
+            # Current displacement at boundary nodes
+            boundary_u_current = u[n, boundary_node_ids, :].clone()
+            # Extract boundary node coordinates
+            boundary_coords_ref = self.nodes[boundary_node_ids]
             # Get pre-computed edges_indexes for this patch
             edges_indexes = self._edges_indexes[patch_id]
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # # OLD: Get material patch nodes (all nodes, not just boundary)
+            # elem_nodes = self.elements[idx_patch]
+            # # Current displacement at increment n
+            # elem_u_current = u[n, elem_nodes, :].clone()
+            # # Extract material patch nodal coordinates
+            # elem_coords_ref = self.nodes[elem_nodes]
+            # # Get pre-computed edges_indexes for this patch
+            # edges_indexes = self._edges_indexes[patch_id]
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             def detach_hidden_states(states):
                 if isinstance(states, dict):
@@ -1488,49 +1353,106 @@ class FEM(ABC):
                     model._gnn_epd_model._decoder._hidden_states = \
                         patch_hidden['decoder']
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Compute patch coordinate rescaling to [0,1]^d
+            # GNN trained on patches with coords in [0,1]^d; rescale inputs
+            coords_min = boundary_coords_ref.min(dim=0).values
+            coords_max = boundary_coords_ref.max(dim=0).values
+            L = coords_max - coords_min  # patch physical size per dimension
+            L = torch.clamp(L, min=1e-12)  # avoid division by zero
+            coords_scaled = (boundary_coords_ref - coords_min) / L
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Model prediction: stepwise vs non-stepwise mode
             hidden_states_trial = None
-            def forward(disp):
-                """Forward function for gradient computation."""
+            def forward(disp_boundary):
+                """Forward function for gradient computation.
+
+                Rescales inputs to [0,1]^d for GNN inference, then rescales
+                forces back to physical space. jacfwd differentiates through
+                the full chain so stiffness is automatically correct.
+                """
                 nonlocal hidden_states_trial
+                # Rescale displacements by patch size
+                disp_scaled = disp_boundary / L
                 if is_stepwise:
-                    node_prediction, hidden_states_out = forward_graph(
+                    pred_scaled, hidden_states_out = forward_graph(
                         model=model,
-                        disps=disp, coords_ref=elem_coords_ref,
+                        disps=disp_scaled, coords_ref=coords_scaled,
                         edges_indexes=edges_indexes, n_dim=self.n_dim)
                     hidden_states_trial = hidden_states_out
                 else:
-                    node_prediction = forward_graph(
+                    pred_scaled = forward_graph(
                         model=model,
-                        disps=disp, coords_ref=elem_coords_ref,
+                        disps=disp_scaled, coords_ref=coords_scaled,
                         edges_indexes=edges_indexes, n_dim=self.n_dim)
-                return node_prediction, node_prediction.detach()
+                # GNN predicts forces in scaled space; unscale to physical
+                pred_real = pred_scaled * L
+                return pred_real, pred_real.detach()
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Compute Jacobian: d(forces_t)/d(u)
-            # Use torch.func.jacrev for vectorized Jacobian computation
-            # jacrev computes J[i,j] = d(output[i])/d(input[j])
-            (jacobian, node_output) = torch_func.jacfwd(
-                forward, has_aux=True)(elem_u_current)
-            node_forces_trial = node_output.flatten()
-            # Reshape Jacobian to stiffness matrix format
-            # jacobian shape: (n_nodes, n_dim, n_nodes, n_dim)
-            # Reshape to: (n_nodes*n_dim, n_nodes*n_dim)
-            stiffness_matrix = jacobian.view(n_dof_elem, n_dof_elem)
+            # Compute Jacobian: d(forces_boundary)/d(u_boundary)
+            (jacobian, boundary_forces) = torch_func.jacfwd(
+                forward, has_aux=True)(boundary_u_current)
+            # Stiffness shape: (n_boundary*dim, n_boundary*dim)
+            k_boundary = jacobian.view(n_dof_boundary, n_dof_boundary)
+            f_boundary = boundary_forces.flatten()
+
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # # OLD: Compute Jacobian for all element nodes
+            # (jacobian, node_output) = torch_func.jacfwd(
+            #     forward, has_aux=True)(elem_u_current)
+            # node_forces_trial = node_output.flatten()
+            # # Reshape Jacobian to stiffness matrix format
+            # stiffness_matrix = jacobian.view(n_dof_elem, n_dof_elem)
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Assemble boundary forces to global force vector
+            for local_i, global_node in enumerate(boundary_node_ids):
+                for d in range(self.n_dim):
+                    global_dof = global_node * self.n_dim + d
+                    local_dof = local_i * self.n_dim + d
+                    F_global[global_dof] += f_boundary[local_dof]
+
+            # Collect boundary stiffness entries for sparse assembly
+            for local_i, global_node_i in enumerate(boundary_node_ids):
+                for d_i in range(self.n_dim):
+                    global_dof_i = global_node_i * self.n_dim + d_i
+                    local_dof_i = local_i * self.n_dim + d_i
+
+                    for local_j, global_node_j in enumerate(
+                            boundary_node_ids):
+                        for d_j in range(self.n_dim):
+                            global_dof_j = global_node_j * self.n_dim + d_j
+                            local_dof_j = local_j * self.n_dim + d_j
+
+                            k_indices.append(
+                                [global_dof_i, global_dof_j])
+                            k_values.append(
+                                k_boundary[local_dof_i, local_dof_j])
 
             # Store updated hidden states for stepwise mode
             if is_stepwise and hidden_states_trial is not None:
                 hidden_states_out[patch_id] = hidden_states_trial
-
-            # Store forces
-            f[idx_patch] = node_forces_trial.flatten()
-            # Store stiffness matrix
-            k[idx_patch] = stiffness_matrix
-            breakpoint()
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # # OLD: Store element forces and stiffness
+            # f[idx_patch] = node_forces_trial.flatten()
+            # k[idx_patch] = stiffness_matrix
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Build global sparse stiffness matrix
+        k_indices_tensor = torch.tensor(k_indices, dtype=torch.long).T
+        k_values_tensor = torch.tensor(k_values)
+        K_global = torch.sparse_coo_tensor(
+            k_indices_tensor, k_values_tensor,
+            (n_dof_global, n_dof_global)
+        ).coalesce()
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # # OLD: Return element-level arrays
+        # if is_stepwise:
+        #     return k, f, hidden_states_out
+        # else:
+        #     return k, f
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if is_stepwise:
-            return k, f, hidden_states_out
-        else:    
-            return k, f
+            return K_global, F_global, hidden_states_out
+        else:
+            return K_global, F_global
     # -------------------------------------------------------------------------
     def solve_matpatch(
         self,
@@ -1551,6 +1473,8 @@ class FEM(ABC):
         is_stepwise: bool = False,
         model_directory: str | None = None,
         return_resnorm: bool = False,
+        patch_boundary_nodes: dict | None = None,
+        patch_elem_per_dim: list | None = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | Tuple[
@@ -1558,8 +1482,8 @@ class FEM(ABC):
         """Solve the FEM problem with material patches and the surrogate model.
 
         Args:
-            is_mat_patch (Tensor): Element-wise flag indicating material patch 
-                usage of shape (n_elem,). Values: 0 = use standard 
+            is_mat_patch (Tensor): Element-wise flag indicating material patch
+                usage of shape (n_elem,). Values: 0 = use standard
                 integration, >0 = material patch ID for surrogate integration.
             increments (Tensor): Load increment stepping of shape 
                 (n_increments,). Defaults to torch.tensor([0.0, 1.0]).
@@ -1622,14 +1546,14 @@ class FEM(ABC):
         con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize variables to be computed
-        u = torch.zeros(N, self.n_nod, self.n_dof_per_node)
-        f = torch.zeros(N, self.n_nod, self.n_dof_per_node)
+        u = torch.zeros(N, self.n_nod, self.n_dim)
+        f = torch.zeros(N, self.n_nod, self.n_dim)
         stress = torch.zeros(N, self.n_int, self.n_elem,
                              self.n_stress, self.n_stress)
         defgrad = torch.zeros(N, self.n_int, self.n_elem,
                               self.n_stress, self.n_stress)
         defgrad[:, :, :, :, :] = torch.eye(self.n_stress)
-        state = torch.zeros(N, self.n_int, self.n_elem, self.operator.n_state)
+        state = torch.zeros(N, self.n_int, self.n_elem, self.material.n_state)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize volumes if requested
         if return_volumes:
@@ -1645,7 +1569,7 @@ class FEM(ABC):
         self.K = torch.empty(0)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize displacement increment
-        du = torch.zeros(self.n_nod, self.n_dof_per_node).ravel()
+        du = torch.zeros_like(self.nodes).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize material patch data structures for surrogate integration
         patch_mask = is_mat_patch >= 0
@@ -1676,43 +1600,50 @@ class FEM(ABC):
             
             # Initialize patch_id dictionary with None values
             patch_ids = torch.unique(is_mat_patch[is_mat_patch >= 0])
-            # Initialize edges_indexes dict
+            # Initialize edges_indexes dict and patch boundary nodes dict
             self._edges_indexes = {}
+            self.patch_bd_nodes = {}
+            # Populate patch boundary nodes from input parameter
+            if patch_boundary_nodes is not None:
+                self.patch_bd_nodes = patch_boundary_nodes
+            breakpoint()
+            # Initialize hidden states dict before loop to accumulate all patches
+            hidden_states_dict = {}
             for pid in patch_ids:
+                pid_int = pid.item()
                 # Build graph topology for this material patch
-                self._build_graph_topology(pid)
+                self._build_graph_topology(pid_int, patch_elem_per_dim)
                 # Initialize hidden states structure for GNN model
                 # Same structure as graphorge:
                 # - encoder: for encoding layers
                 # - processor: for message passing layers (layer_0, layer_1, etc.)
                 # - decoder: for decoding layers
                 # Each layer can have node, edge, global hidden states
-                
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Get number of message passing steps from model if available
                 n_message_steps = model._n_message_steps
-                
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Create processor hidden states for each layer
                 processor_hidden = {}
                 for layer_idx in range(n_message_steps):
                     processor_hidden[f'layer_{layer_idx}'] = {
                         'node': None,
-                        'edge': None, 
+                        'edge': None,
                         'global': None
                     }
-                
-                hidden_states_dict = {
-                    f"patch_{pid.item()}": {
-                        'encoder': {
-                            'node': None,
-                            'edge': None,
-                            'global': None
-                        },
-                        'processor': processor_hidden,
-                        'decoder': {
-                            'node': None,
-                            'edge': None,
-                            'global': None
-                        }
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Accumulate hidden states for each patch
+                hidden_states_dict[f"patch_{pid_int}"] = {
+                    'encoder': {
+                        'node': None,
+                        'edge': None,
+                        'global': None
+                    },
+                    'processor': processor_hidden,
+                    'decoder': {
+                        'node': None,
+                        'edge': None,
+                        'global': None
                     }
                 }
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1731,60 +1662,45 @@ class FEM(ABC):
             for i in range(max_iter):
                 du[con] = DU[con]
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Element-wise integration with material patch support
-                # Initialize element stiffness and force arrays
-                n_nod = self.etype.nodes
-                k = torch.zeros((self.n_elem, self.n_dim * n_nod,
-                                 self.n_dim * n_nod))
-                f_i = torch.zeros(self.n_elem, self.n_dim * n_nod)
+                # # OLD: Element-wise integration with material patch support
+                # # Initialize element stiffness and force arrays
+                # n_nod = self.etype.nodes
+                # k = torch.zeros((self.n_elem, self.n_dim * n_nod,
+                #                  self.n_dim * n_nod))
+                # f_i = torch.zeros(self.n_elem, self.n_dim * n_nod)
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # # Standard integration for elements with is_mat_patch == 0
-                # std_mask = is_mat_patch == 0
-                # if torch.any(std_mask):
-                #     # Create temporary arrays for standard integration
-                #     std_indices = torch.nonzero(
-                #         std_mask, as_tuple=False).squeeze(-1)
-                #     if std_indices.numel() > 0:
-                #         k_std, f_std = self.integrate_material(
-                #             u, defgrad, stress, state, n, du, de0, nlgeom
-                #         )
-                #         k[std_indices] = k_std[std_indices]
-                #         f_i[std_indices] = f_std[std_indices]
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Surrogate integration for elements with is_mat_patch >= 0
+                # Surrogate integration returns global K and F
                 patch_mask = is_mat_patch >= 0
                 if torch.any(patch_mask):
                     # Get unique patch IDs and process all at once
                     patch_ids = torch.unique(is_mat_patch[patch_mask])
-                    # Call surrogate integration
-                    # profiler_surr = cProfile.Profile()
-                    # profiler_surr.enable()
+                    # Call surrogate integration (returns global K and F)
                     if is_stepwise:
-                        k_surr, f_surr, hidden_state_out = \
+                        K_raw, F_int, hidden_state_out = \
                             self.surrogate_integrate_material(
                             model, u, n, du,
                             is_stepwise=is_stepwise,
                             patch_ids=patch_ids,
                             hidden_states=hidden_states_dict)
                     else:
-                        k_surr, f_surr = \
+                        K_raw, F_int = \
                             self.surrogate_integrate_material(
                             model, u, n, du,
                             is_stepwise=is_stepwise,
                             patch_ids=patch_ids)
-                    # profiler_surr.disable()
-                    # print(f"\n=== surrogate_integrate_material PROFILE (increment {n}) ===")
-                    # stats_surr = pstats.Stats(profiler_surr)
-                    # stats_surr.sort_stats('cumulative').print_stats(10)
-                    # Assemble results for all patches
-                    k[patch_mask] = k_surr[patch_mask]
-                    f_i[patch_mask] = f_surr[patch_mask]
+                    # Apply constraint elimination
+                    self.K = \
+                        self._apply_constraints_sparse(
+                            K_raw, con)
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Assemble global stiffness matrix and internal force vector
-                if self.K.numel() == 0 or not self.operator.n_state == 0 or \
-                    nlgeom:
-                    self.K = self.assemble_stiffness(k, con)
-                F_int = self.assemble_force(f_i)
+                # # OLD: Assemble results for all patches
+                # k[patch_mask] = k_surr[patch_mask]
+                # f_i[patch_mask] = f_surr[patch_mask]
+                # # OLD: Assemble global stiffness matrix and internal force
+                # if self.K.numel() == 0 or not self.material.n_state == 0 or \
+                #     nlgeom:
+                #     self.K = self.assemble_stiffness(k, con)
+                # F_int = self.assemble_force(f_i)
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Compute residual
                 residual = F_int - F_ext
@@ -1843,8 +1759,8 @@ class FEM(ABC):
                 raise Exception("Newton-Raphson iteration did not converge.")
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Update increment
-            f[n] = F_int.reshape((-1, self.n_dof_per_node))
-            u[n] = u[n - 1] + du.reshape((-1, self.n_dof_per_node))
+            f[n] = F_int.reshape((-1, self.n_dim))
+            u[n] = u[n - 1] + du.reshape((-1, self.n_dim))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute element volumes if requested
             if return_volumes:

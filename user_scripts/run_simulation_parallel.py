@@ -107,18 +107,18 @@ if __name__ == '__main__':
     filepath = '/Volumes/T7/material_patches_data/'
 
     configs = []
-    for idx in range(0, 15):
+    for idx in range(1724, 1725):
         configs.append({
             'element_type': 'quad4',
             'material_behavior': 'elastoplastic_nlh',
             'num_increments': 100,
             'patch_idx': idx,
             'filepath': filepath,
-            'mesh_nx': 3,
-            'mesh_ny': 3,
+            'mesh_nx': 5,
+            'mesh_ny': 5,
             'mesh_nz': 1,
             'is_save': True,
-            'is_red_int': True
+            'is_red_int': True,
         })
 
     results = run_parallel_simulations(
