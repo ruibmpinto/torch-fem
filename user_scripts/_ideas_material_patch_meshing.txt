@@ -1,0 +1,54 @@
+What a material patch mesh looks like
+
+GEOMETRIES to consider with material patches (progressively refine the 
+geometries):
+    
+
+- Cube/rectangle with uniform mesh of quads/hex (
+    including cantilever beam)
+
+- Cube/rectangle with non-uniform mesh of tri and tets
+
+- Plate with hole with triangles
+
+- L-shape domain with tri/quads
+
+- Porous cubic/rectangular RVE
+
+- Only mat patches, no hybrid!!!
+
+Memory and speed profiling of code versus
+standard newton-raphson:
+
+- begin implementing these nodes for current code
+(use agnostic function, integrate material)
+
+
+nodes:
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+
+element
+1 1 2 ... 12
+
+u.x.array[3*2] = 0.0286878
+u.x.array[3*2 + 1] = 0.0428083
+
+u.x.array[5*2] = 0.0201981        
+u.x.array[5*2 + 1] = 0.0237266
+
+u.x.array[7*2] = 0.0287869
+u.x.array[7*2 + 1] = 0.0371176
+
+u.x.array[10*2] = 0.0151731         
+u.x.array[10*2 + 1] = 0.024637
