@@ -801,7 +801,6 @@ class FEM(ABC):
             # For small strain: epsilon = 0.5*(H + H^T)
             delta_eps = 0.5 * (H_inc + H_inc.transpose(-1, -2)).requires_grad_(
                 True)
-            breakpoint()
             # Prepare strains in torch-fem order for gradient computation
             delta_eps_msc = torch.zeros(self.n_elem, 6)
             delta_eps_msc[:, 0] = delta_eps[:, 0, 0]  # eps_11
