@@ -1120,13 +1120,22 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return tuple(result)
     # -------------------------------------------------------------------------
-    def _build_graph_topology(self, patch_id: int, patch_elem_per_dim=None):
-        """Build and store graph topology for a material patch.
+    def _build_graph_topology(self, patch_id,
+                              patch_elem_per_dim=None,
+                              edge_type='all'):
+        """Build and store graph topology for a patch.
 
-        Args:
-            patch_id (int): Material patch identifier.
-            patch_elem_per_dim (list): Number of elements per dimension in
-                the patch, e.g., [2, 2] for 2x2 patch. Defaults to [1, 1].
+        Parameters
+        ----------
+        patch_id : int
+            Material patch identifier.
+        patch_elem_per_dim : list, default=None
+            Elements per dimension, e.g. [2, 2].
+            Defaults to [1, 1].
+        edge_type : {'all', 'bd'}, default='all'
+            Edge connectivity type. 'all' uses
+            radius_mult=20.0, 'bd' uses 0.8.
+            Must match the training configuration.
         """
         # Get material patch boundary nodes
         boundary_node_ids = self.patch_bd_nodes[patch_id]
@@ -1184,22 +1193,52 @@ class FEM(ABC):
         gnn_patch_data = GraphData(
             n_dim=dim, nodes_coords=node_coords_init)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Set connectivity radius based on finite element size
-        connect_radius = 4 * np.sqrt(np.sum([x**2 for x in 
-            get_elem_size_dims(patch_dim, n_elem_per_dim, dim)]))
+        # Set connectivity radius based on element size
+        if edge_type == 'all':
+            radius_mult = 20.0
+        elif edge_type == 'bd':
+            radius_mult = 0.8
+        else:
+            raise RuntimeError(
+                f'Unknown edge_type: {edge_type}')
+        connect_radius = radius_mult * np.sqrt(
+            np.sum([x**2 for x in get_elem_size_dims(
+                patch_dim, n_elem_per_dim, dim)]))
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Get boundary node information
-        n_boundary = len(boundary_node_ids)
-        bd_node_indices = list(range(n_boundary))
+        # Identify perimeter nodes from local mesh
+        # (matches training code in gen_graphs_files.py)
+        if dim == 2:
+            bd_node_indices = []
+            for i in range(mesh_nx + 1):
+                for j in range(mesh_ny + 1):
+                    if (i == 0 or i == mesh_nx
+                            or j == 0
+                            or j == mesh_ny):
+                        bd_node_indices.append(
+                            mesh_nodes_matrix[i, j])
+            bd_node_indices = sorted(bd_node_indices)
+        elif dim == 3:
+            bd_node_indices = []
+            for i in range(mesh_nx + 1):
+                for j in range(mesh_ny + 1):
+                    for k in range(mesh_nz + 1):
+                        if (i == 0
+                                or i == mesh_nx
+                                or j == 0
+                                or j == mesh_ny
+                                or k == 0
+                                or k == mesh_nz):
+                            bd_node_indices.append(
+                                mesh_nodes_matrix[
+                                    i, j, k])
+            bd_node_indices = sorted(bd_node_indices)
         boundary_node_set = set(bd_node_indices)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # # OLD: for single element all nodes are boundary nodes
-        # bd_node_indices = list(range(n_nod))
-        # boundary_node_set = set(bd_node_indices)
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Create mapping from original to boundary indices
-        original_to_boundary_idx = {node_id: position for position,
-                                    node_id in enumerate(bd_node_indices)}
+        # Map local perimeter index to sequential
+        # boundary position
+        original_to_boundary_idx = {
+            node_id: position for position,
+            node_id in enumerate(bd_node_indices)}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Get finite element mesh edges for all nodes
         connected_nodes_all = get_mesh_connected_nodes(
@@ -1235,6 +1274,7 @@ class FEM(ABC):
         is_stepwise: bool = False,
         patch_ids: Tensor = None,
         hidden_states: dict = None,
+        edge_feature_type: tuple = ('edge_vector',),
     ) -> Tuple[Tensor, Tensor]:
         """Perform surrogate integration using Graphorge material patch model.
 
@@ -1375,14 +1415,20 @@ class FEM(ABC):
                 if is_stepwise:
                     pred_scaled, hidden_states_out = forward_graph(
                         model=model,
-                        disps=disp_scaled, coords_ref=coords_scaled,
-                        edges_indexes=edges_indexes, n_dim=self.n_dim)
+                        disps=disp_scaled,
+                        coords_ref=coords_scaled,
+                        edges_indexes=edges_indexes,
+                        n_dim=self.n_dim,
+                        edge_feature_type=edge_feature_type)
                     hidden_states_trial = hidden_states_out
                 else:
                     pred_scaled = forward_graph(
                         model=model,
-                        disps=disp_scaled, coords_ref=coords_scaled,
-                        edges_indexes=edges_indexes, n_dim=self.n_dim)
+                        disps=disp_scaled,
+                        coords_ref=coords_scaled,
+                        edges_indexes=edges_indexes,
+                        n_dim=self.n_dim,
+                        edge_feature_type=edge_feature_type)
                 # GNN predicts forces in scaled space; unscale to physical
                 pred_real = pred_scaled * L
                 return pred_real, pred_real.detach()
@@ -1474,6 +1520,8 @@ class FEM(ABC):
         return_resnorm: bool = False,
         patch_boundary_nodes: dict | None = None,
         patch_elem_per_dim: list | None = None,
+        edge_type: str = 'all',
+        edge_feature_type: tuple = ('edge_vector',),
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | Tuple[
@@ -1611,7 +1659,9 @@ class FEM(ABC):
             for pid in patch_ids:
                 pid_int = pid.item()
                 # Build graph topology for this material patch
-                self._build_graph_topology(pid_int, patch_elem_per_dim)
+                self._build_graph_topology(
+                    pid_int, patch_elem_per_dim,
+                    edge_type=edge_type)
                 # Initialize hidden states structure for GNN model
                 # Same structure as graphorge:
                 # - encoder: for encoding layers
@@ -1680,13 +1730,15 @@ class FEM(ABC):
                             model, u, n, du,
                             is_stepwise=is_stepwise,
                             patch_ids=patch_ids,
-                            hidden_states=hidden_states_dict)
+                            hidden_states=hidden_states_dict,
+                            edge_feature_type=edge_feature_type)
                     else:
                         K_raw, F_int = \
                             self.surrogate_integrate_material(
                             model, u, n, du,
                             is_stepwise=is_stepwise,
-                            patch_ids=patch_ids)
+                            patch_ids=patch_ids,
+                            edge_feature_type=edge_feature_type)
                     # Apply constraint elimination
                     self.K = \
                         self._apply_constraints_sparse(
@@ -1794,92 +1846,89 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return tuple(result)
 # =============================================================================
-def compute_edge_features(coords_hist, disps_hist, edges_indexes, 
-                              n_dim):
-        """Compute edge features following the logic of features.py.
-        
-        Computes edge features ('edge_vector', 'relative_disp').
-        
+def compute_edge_features(coords_hist, disps_hist,
+                          edges_indexes, n_dim,
+                          n_edge_in=None):
+        """Compute edge features for GNN inference.
+
+        Computes edge_vector and optionally relative_disp,
+        depending on the model's expected n_edge_in.
+
         Parameters
         ----------
         coords_hist : torch.Tensor
-            Node coordinates history (coord_hist feature),
-            shape (n_nodes, n_time_steps*n_dim)
-        disps_hist : torch.Tensor  
-            Node displacements history (disp_hist feature),
-            shape (n_nodes, n_time_steps*n_dim)
+            Current node coordinates,
+            shape (n_nodes, n_time_steps*n_dim).
+        disps_hist : torch.Tensor
+            Node displacements,
+            shape (n_nodes, n_time_steps*n_dim).
         edges_indexes : torch.Tensor
-            Edge connectivity, shape (2, n_edges)
+            Edge connectivity, shape (2, n_edges).
         n_dim : int
-            Spatial dimensions
-            
+            Spatial dimensions.
+        n_edge_in : {int, None}, default=None
+            Number of edge input features expected by model.
+            If n_dim: only edge_vector.
+            If 2*n_dim: edge_vector + relative_disp.
+            If None: include both.
+
         Returns
         -------
         edge_features : torch.Tensor
-            Edge features [edge_vector, relative_disp],
-            shape (n_edges, 2*n_time_steps*n_dim)
+            Shape (n_edges, n_edge_in).
         """
-        # Get edge connections
-        # Source nodes
         edge_sources = edges_indexes[0]
-        # Target nodes
-        edge_targets = edges_indexes[1]  
+        edge_targets = edges_indexes[1]
         n_edges = edge_sources.shape[0]
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Compute number of time steps
         n_coords_features = coords_hist.shape[1]
         n_time_steps = n_coords_features // n_dim
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Edge features: [edge_vector, relative_disp]
-        # Each edge has n_time_steps * n_dim components
         edge_vector_size = n_time_steps * n_dim
-        relative_disp_size = n_time_steps * n_dim
-        n_edge_features = edge_vector_size + relative_disp_size
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Determine which features to include
+        include_rel_disp = True
+        if n_edge_in is not None:
+            if n_edge_in == edge_vector_size:
+                include_rel_disp = False
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if include_rel_disp:
+            n_edge_features = 2 * edge_vector_size
+        else:
+            n_edge_features = edge_vector_size
         edge_features = torch.zeros(
-            n_edges, n_edge_features, device=coords_hist.device)
+            n_edges, n_edge_features,
+            device=coords_hist.device)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # coords_hist already contains current coordinates
-        # (reference + displacements)
         current_coords_hist = coords_hist
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Loop over edges
         for k in range(n_edges):
-            # Source node
             i = edge_sources[k]
-            # Target node
-            j = edge_targets[k]  
+            j = edge_targets[k]
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Compute edge_vector: current_coords[i] - current_coords[j]
-            # See lines 443-445 in features.py
+            # edge_vector: coords[i] - coords[j]
             for t in range(n_time_steps):
-                # Set start and end indices for each time step
-                start_idx = t * n_dim
-                end_idx = (t + 1) * n_dim
-                # Edge vector for time step t
-                edge_vector_t = (current_coords_hist[i, start_idx:end_idx] - 
-                               current_coords_hist[j, start_idx:end_idx])
-                # Store in edge features
-                edge_features[k, start_idx:end_idx] = edge_vector_t
+                s = t * n_dim
+                e = (t + 1) * n_dim
+                edge_features[k, s:e] = (
+                    current_coords_hist[i, s:e]
+                    - current_coords_hist[j, s:e])
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Compute relative_disp: disps[i] - disps[j]  
-            # See lines 505-508 in features.py
-            for t in range(n_time_steps):
-                # Set start and end indices for each time step
-                start_idx = t * n_dim
-                end_idx = (t + 1) * n_dim
-                # Relative displacement for time step t
-                relative_disp_t = (disps_hist[i, start_idx:end_idx] - 
-                                 disps_hist[j, start_idx:end_idx]) 
-                # Store in edge features (after edge_vector section)
-                edge_features[k,edge_vector_size + \
-                              start_idx:edge_vector_size + end_idx] = \
-                                relative_disp_t
+            # relative_disp: disps[i] - disps[j]
+            if include_rel_disp:
+                for t in range(n_time_steps):
+                    s = t * n_dim
+                    e = (t + 1) * n_dim
+                    offset = edge_vector_size + s
+                    edge_features[k, offset:offset
+                                  + n_dim] = (
+                        disps_hist[i, s:e]
+                        - disps_hist[j, s:e])
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return edge_features
 # =============================================================================
 def forward_graph(
         model, disps, coords_ref, edges_indexes, n_dim,
-        batch_vector=None, global_features_in=None):
+        batch_vector=None, global_features_in=None,
+        edge_feature_type=('edge_vector',)):
         """Forward pass through GNN model with graph data reconstruction.
 
         Args:
@@ -1899,9 +1948,12 @@ def forward_graph(
         """
         coords = coords_ref + disps
         node_features_in = torch.cat([coords, disps], dim=1)
-        # Recompute edge features based on updated data coords:
+        # Derive n_edge_in from user-specified features
+        n_edge_in = len(edge_feature_type) * n_dim
+        # Recompute edge features based on updated coords
         edge_features_in = compute_edge_features(
-            coords, disps, edges_indexes, n_dim)
+            coords, disps, edges_indexes, n_dim,
+            n_edge_in=n_edge_in)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Forward pass with updated features
         # Stepwise forward mode

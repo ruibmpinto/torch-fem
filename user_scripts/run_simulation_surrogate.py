@@ -42,7 +42,7 @@ from utils.boundary_conditons import prescribe_disps_by_coords
 
 # Matplotlib.pyplot default parameters
 plt.rcParams.update({
-    "text.usetex": True,
+    "text.usetex": False,
     "font.family": "serif",
     "font.serif": ["Computer Modern Roman"],
     "font.size": 12,
@@ -70,7 +70,8 @@ def run_simulation_surrogate(
     material_behavior='elastic',
     mesh_nx=1, mesh_ny=1, mesh_nz=1,
     patch_size_x=1, patch_size_y=1, patch_size_z=1,
-    model_path=None):
+    model_path=None, edge_type='all',
+    edge_feature_type=('edge_vector',)):
     """
     Run simulation using solve_matpatch function with Graphorge surrogate model
     """
@@ -109,8 +110,10 @@ def run_simulation_surrogate(
         dim = 3
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Default model path if not provided
-    # Models stored in results/matpatch_surrogates/{behavior}/{NxN}/model
+    # Models stored in matpatch_surrogates/{behavior}/{NxN}/model
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    torch_fem_root = os.path.dirname(script_dir)
+    results_base = os.path.join(torch_fem_root, 'results')
     surrogates_dir = os.path.join(script_dir, 'matpatch_surrogates')
     if model_path is None:
         patch_str = f'{patch_size_x}x{patch_size_y}'
@@ -355,9 +358,9 @@ def run_simulation_surrogate(
         mesh_str += f"x{mesh_nz}"
         patch_str += f"x{patch_size_z}"
     n_increments = len(increments_ref) - 1
-    output_dir = (
-        f"results/{material_behavior}/{dim}d/{element_type}/"
-        f"mesh_{mesh_str}/patch_{patch_str}/"
+    output_dir = os.path.join(
+        results_base, material_behavior, f"{dim}d", element_type,
+        f"mesh_{mesh_str}", f"patch_{patch_str}",
         f"n_time_inc_{n_increments}")
     os.makedirs(output_dir, exist_ok=True)
     plot_path = os.path.join(
@@ -403,9 +406,9 @@ def run_simulation_surrogate(
         patch_str += f"x{patch_size_z}"
     n_increments = len(increments) - 1
 
-    output_dir = (
-        f"results/{material_behavior}/{dim}d/{element_type}/"
-        f"mesh_{mesh_str}/patch_{patch_str}/"
+    output_dir = os.path.join(
+        results_base, material_behavior, f"{dim}d", element_type,
+        f"mesh_{mesh_str}", f"patch_{patch_str}",
         f"n_time_inc_{n_increments}")
     os.makedirs(output_dir, exist_ok=True)
     
@@ -463,7 +466,9 @@ def run_simulation_surrogate(
         is_stepwise=is_stepwise,
         model_directory=model_path,
         patch_boundary_nodes=patch_boundary_nodes_dict,
-        patch_elem_per_dim=patch_elem_per_dim
+        patch_elem_per_dim=patch_elem_per_dim,
+        edge_type=edge_type,
+        edge_feature_type=edge_feature_type
     )
     profiler_matpatch.disable()
     print("\n=== SOLVE_MATPATCH METHOD PROFILE ===")
@@ -491,9 +496,9 @@ def run_simulation_surrogate(
     # WHY: # Subtract 1 for initial condition
     n_increments = len(increments) - 1
 
-    output_dir = (
-        f"results/{material_behavior}/{dim}d/{element_type}/"
-        f"mesh_{mesh_str}/patch_{patch_str}/"
+    output_dir = os.path.join(
+        results_base, material_behavior, f"{dim}d", element_type,
+        f"mesh_{mesh_str}", f"patch_{patch_str}",
         f"n_time_inc_{n_increments}")
     os.makedirs(output_dir, exist_ok=True)
     # Save results
@@ -589,8 +594,10 @@ if __name__ == '__main__':
     run_simulation_surrogate(
         element_type='quad4',
         material_behavior='elastic',
-        mesh_nx=8,
-        mesh_ny=8,
-        mesh_nz=8,
-        patch_size_x=2,
-        patch_size_y=2)
+        mesh_nx=16,
+        mesh_ny=16,
+        mesh_nz=1,
+        patch_size_x=8,
+        patch_size_y=8,
+        edge_type='all',
+        edge_feature_type=('edge_vector', 'rel_disp'))

@@ -111,8 +111,9 @@ def run_l_shape_example():
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Visualize
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    results_base = os.path.join(
-        os.path.dirname(script_dir), 'results')
+    torch_fem_root = os.path.dirname(
+        os.path.dirname(script_dir))
+    results_base = os.path.join(torch_fem_root, 'results')
     output_dir = os.path.join(
         results_base, 'elastic', '2d', 'quad4', 'L_shaped')
     os.makedirs(output_dir, exist_ok=True)
