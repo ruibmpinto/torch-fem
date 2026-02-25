@@ -379,6 +379,11 @@ def run_simulation_surrogate(
         pkl.dump(results_ref, fh)
     print(f"Reference results saved to {ref_file}")
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Save reference constraint state before locking internal
+    # nodes (needed for plotting reference fields later)
+    constraints_ref = domain.constraints.clone()
+    displacements_bc_ref = domain.displacements.clone()
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Constrain internal patch nodes (zero displacement, all DOFs)
     # for surrogate solve
     for node_id in patch_internal_nodes:
@@ -559,22 +564,52 @@ def run_simulation_surrogate(
     plt.savefig(plot_path)
     plt.close()
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Plot force field
-    # Get final force field
-    # Shape: (n_nodes, n_dim)
+    # Plot force fields (surrogate and reference)
     f_final = f[-1]
-    
+    f_ref_final = f_ref[-1]
+    # Shared colorbar limits
+    f_all = torch.cat([
+        torch.norm(f_final, dim=1),
+        torch.norm(f_ref_final, dim=1)])
+    vmin_f = f_all.min().item()
+    vmax_f = f_all.max().item()
+
     domain.plot(
         u=u_final,
         node_property=torch.norm(f_final, dim=1),
-        title=r'Force Magnitude $||\mathbf{f}||_{2}$',
+        title=r'Surrogate: $||\mathbf{f}||_{2}$',
         colorbar=True,
-        cmap='plasma'
-    )
-    
-    force_plot_path = os.path.join(output_dir, "force_field.png")
-    plt.savefig(force_plot_path)
+        cmap='plasma',
+        vmin=vmin_f,
+        vmax=vmax_f)
+    plot_path = os.path.join(
+        output_dir, 'force_field_srg.png')
+    plt.savefig(plot_path)
     plt.close()
+
+    # Restore reference constraints so domain.plot renders
+    # without internal-node BC markers
+    constraints_srg = domain.constraints.clone()
+    displacements_bc_srg = domain.displacements.clone()
+    domain.constraints = constraints_ref
+    domain.displacements = displacements_bc_ref
+
+    domain.plot(
+        u=u_ref_final,
+        node_property=torch.norm(f_ref_final, dim=1),
+        title=r'Reference: $||\mathbf{f}||_{2}$',
+        colorbar=True,
+        cmap='plasma',
+        vmin=vmin_f,
+        vmax=vmax_f)
+    plot_path = os.path.join(
+        output_dir, 'force_field_ref.png')
+    plt.savefig(plot_path)
+    plt.close()
+
+    # Restore surrogate constraints
+    domain.constraints = constraints_srg
+    domain.displacements = displacements_bc_srg
 
     f_diff = torch.abs(f[-1] - f_ref[-1]) 
 
@@ -591,6 +626,7 @@ def run_simulation_surrogate(
     plt.close()
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
+    # 8x8 patch on 16x16 mesh (L=1, baseline / no-regression)
     run_simulation_surrogate(
         element_type='quad4',
         material_behavior='elastic',
@@ -599,5 +635,16 @@ if __name__ == '__main__':
         mesh_nz=1,
         patch_size_x=8,
         patch_size_y=8,
+        edge_type='all',
+        edge_feature_type=('edge_vector', 'rel_disp'))
+    # 2x2 patch on 16x16 mesh (L=0.125, centering test)
+    run_simulation_surrogate(
+        element_type='quad4',
+        material_behavior='elastic',
+        mesh_nx=16,
+        mesh_ny=16,
+        mesh_nz=1,
+        patch_size_x=2,
+        patch_size_y=2,
         edge_type='all',
         edge_feature_type=('edge_vector', 'rel_disp'))

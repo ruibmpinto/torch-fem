@@ -1405,13 +1405,31 @@ class FEM(ABC):
             def forward(disp_boundary):
                 """Forward function for gradient computation.
 
-                Rescales inputs to [0,1]^d for GNN inference, then rescales
-                forces back to physical space. jacfwd differentiates through
-                the full chain so stiffness is automatically correct.
+                Rescales inputs to [0,1]^d for GNN inference,
+                then rescales forces back to physical space.
+                jacfwd differentiates through the full chain so
+                stiffness is automatically correct.
+
+                Displacement centering removes rigid body
+                translation before 1/L scaling. Without this,
+                patches with L < 1 amplify the absolute
+                displacement (which includes the patch's
+                position-dependent rigid body component),
+                pushing normalized features far outside the
+                training distribution [-1, 1].
+
+                The Jacobian of centering is I - (1/N)*ones,
+                which projects out the uniform translation mode
+                from K. Dirichlet BCs remove the resulting null
+                space via _apply_constraints_sparse.
                 """
                 nonlocal hidden_states_trial
-                # Rescale displacements by patch size
-                disp_scaled = disp_boundary / L
+                # Center displacements to remove rigid body
+                # translation before scaling by patch size
+                disp_mean = disp_boundary.mean(
+                    dim=0, keepdim=True)
+                disp_centered = disp_boundary - disp_mean
+                disp_scaled = disp_centered / L
                 if is_stepwise:
                     pred_scaled, hidden_states_out = forward_graph(
                         model=model,
@@ -1653,7 +1671,6 @@ class FEM(ABC):
             # Populate patch boundary nodes from input parameter
             if patch_boundary_nodes is not None:
                 self.patch_bd_nodes = patch_boundary_nodes
-            breakpoint()
             # Initialize hidden states dict before loop to accumulate all patches
             hidden_states_dict = {}
             for pid in patch_ids:
