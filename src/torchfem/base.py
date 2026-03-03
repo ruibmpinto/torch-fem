@@ -11,19 +11,32 @@ from .elements import Element, Quad1, Quad2, Hexa1, Hexa2
 from .materials import Material
 from .sparse import CachedSolve, sparse_solve
 
-import torch_geometric.data as pyg_data
-from graphorge.gnn_base_model.model.gnn_model import GNNEPDBaseModel
-from graphorge.gnn_base_model.data.graph_data import GraphData
-from graphorge.projects.material_patches.gnn_model_tools.gen_graphs_files \
-    import (get_elem_size_dims, get_mesh_connected_nodes)
-from graphorge.projects.material_patches.gnn_model_tools.features import (
-    GNNPatchFeaturesGenerator)
-from graphorge.gnn_base_model.model.custom_layers import (
-    compute_stiffness_matrix, extract_forces,
-    extract_displacements, compute_edge_features,
-    reconstruct_graph_with_displacements)
-import torch.func as torch_func
+import os
 import functools
+
+is_import_graphorge = (
+    os.environ.get('TORCHFEM_IMPORT_GRAPHORGE', '0') == '1')
+
+if is_import_graphorge:
+    import torch_geometric.data as pyg_data
+    from graphorge.gnn_base_model.model.gnn_model \
+        import GNNEPDBaseModel
+    from graphorge.gnn_base_model.data.graph_data \
+        import GraphData
+    from graphorge.projects.material_patches \
+        .gnn_model_tools.gen_graphs_files \
+        import (get_elem_size_dims,
+                get_mesh_connected_nodes)
+    from graphorge.projects.material_patches \
+        .gnn_model_tools.features import (
+            GNNPatchFeaturesGenerator)
+    from graphorge.gnn_base_model.model.custom_layers \
+        import (compute_stiffness_matrix,
+                extract_forces,
+                extract_displacements,
+                compute_edge_features,
+                reconstruct_graph_with_displacements)
+    import torch.func as torch_func
 
 
 class FEM(ABC):

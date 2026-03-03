@@ -25,6 +25,9 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
+# Enable graphorge imports in torchfem
+os.environ['TORCHFEM_IMPORT_GRAPHORGE'] = '1'
+
 # Local
 from torchfem import Solid, Planar
 from torchfem.materials import (
