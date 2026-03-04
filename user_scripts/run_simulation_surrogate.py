@@ -46,8 +46,6 @@ from utils.boundary_conditons import prescribe_disps_by_coords
 # Matplotlib.pyplot default parameters
 plt.rcParams.update({
     "text.usetex": False,
-    "font.family": "serif",
-    "font.serif": ["Computer Modern Roman"],
     "font.size": 12,
     "axes.titlesize": 16,
     "figure.dpi": 360,
@@ -462,7 +460,27 @@ def run_simulation_surrogate(
     if dim == 2:
         patch_elem_per_dim = [patch_size_x, patch_size_y]
     elif dim == 3:
-        patch_elem_per_dim = [patch_size_x, patch_size_y, patch_size_z]
+        patch_elem_per_dim = [
+            patch_size_x, patch_size_y, patch_size_z]
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Build output directory paths for stiffness saving
+    mesh_str = f'{mesh_nx}x{mesh_ny}'
+    patch_str = f'{patch_size_x}x{patch_size_y}'
+    if dim == 3:
+        mesh_str += f'x{mesh_nz}'
+        patch_str += f'x{patch_size_z}'
+    n_increments = len(increments) - 1
+    output_dir = os.path.join(
+        results_base, material_behavior, f'{dim}d',
+        element_type, f'mesh_{mesh_str}',
+        f'patch_{patch_str}',
+        f'n_time_inc_{n_increments}')
+    os.makedirs(output_dir, exist_ok=True)
+    # Create stiffness output directory
+    stiffness_dir = os.path.join(
+        output_dir, 'stiffness')
+    os.makedirs(stiffness_dir, exist_ok=True)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     u, f, _, _, _ = domain.solve_matpatch(
         is_mat_patch=is_mat_patch,
         increments=increments,
@@ -476,7 +494,10 @@ def run_simulation_surrogate(
         patch_boundary_nodes=patch_boundary_nodes_dict,
         patch_elem_per_dim=patch_elem_per_dim,
         edge_type=edge_type,
-        edge_feature_type=edge_feature_type
+        edge_feature_type=edge_feature_type,
+        is_export_stiffness=True,
+        stiffness_output_dir=stiffness_dir,
+        patch_size_label=patch_str,
     )
     profiler_matpatch.disable()
     print("\n=== SOLVE_MATPATCH METHOD PROFILE ===")
@@ -492,23 +513,6 @@ def run_simulation_surrogate(
     # stats = pstats.Stats(profiler)
     # stats.sort_stats('cumulative').print_stats(15)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Outputs
-    # Create directory structure for outputs
-    mesh_str = f"{mesh_nx}x{mesh_ny}"
-    patch_str = f"{patch_size_x}x{patch_size_y}"
-    if dim == 3:
-        mesh_str += f"x{mesh_nz}"
-        patch_str += f"x{patch_size_z}"
-
-    # Determine number of increments for output directory
-    # WHY: # Subtract 1 for initial condition
-    n_increments = len(increments) - 1
-
-    output_dir = os.path.join(
-        results_base, material_behavior, f"{dim}d", element_type,
-        f"mesh_{mesh_str}", f"patch_{patch_str}",
-        f"n_time_inc_{n_increments}")
-    os.makedirs(output_dir, exist_ok=True)
     # Save results
     results = {
         'displacements': u.detach().cpu().numpy(),
@@ -633,21 +637,21 @@ if __name__ == '__main__':
     run_simulation_surrogate(
         element_type='quad4',
         material_behavior='elastic',
-        mesh_nx=16,
-        mesh_ny=16,
+        mesh_nx=12,
+        mesh_ny=12,
         mesh_nz=1,
-        patch_size_x=8,
-        patch_size_y=8,
+        patch_size_x=3,
+        patch_size_y=3,
         edge_type='all',
         edge_feature_type=('edge_vector', 'rel_disp'))
     # 2x2 patch on 16x16 mesh (L=0.125, centering test)
-    run_simulation_surrogate(
-        element_type='quad4',
-        material_behavior='elastic',
-        mesh_nx=16,
-        mesh_ny=16,
-        mesh_nz=1,
-        patch_size_x=2,
-        patch_size_y=2,
-        edge_type='all',
-        edge_feature_type=('edge_vector', 'rel_disp'))
+    # run_simulation_surrogate(
+    #     element_type='quad4',
+    #     material_behavior='elastic',
+    #     mesh_nx=16,
+    #     mesh_ny=16,
+    #     mesh_nz=1,
+    #     patch_size_x=2,
+    #     patch_size_y=2,
+    #     edge_type='all',
+    #     edge_feature_type=('edge_vector', 'rel_disp'))

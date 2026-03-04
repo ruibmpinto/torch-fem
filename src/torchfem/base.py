@@ -1334,6 +1334,8 @@ class FEM(ABC):
         # Sparse stiffness assembly (COO format)
         k_indices = []
         k_values = []
+        # Per-patch boundary stiffness matrices
+        patch_stiffness_dict = {}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # # OLD: Initialize nodal force and stiffness
         # n_nod = self.etype.nodes
@@ -1468,8 +1470,12 @@ class FEM(ABC):
             (jacobian, boundary_forces) = torch_func.jacfwd(
                 forward, has_aux=True)(boundary_u_current)
             # Stiffness shape: (n_boundary*dim, n_boundary*dim)
-            k_boundary = jacobian.view(n_dof_boundary, n_dof_boundary)
+            k_boundary = jacobian.view(
+                n_dof_boundary, n_dof_boundary)
             f_boundary = boundary_forces.flatten()
+            # Store per-patch boundary stiffness
+            patch_stiffness_dict[idx_patch] = \
+                k_boundary.detach().clone()
 
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # # OLD: Compute Jacobian for all element nodes
@@ -1526,9 +1532,12 @@ class FEM(ABC):
         #     return k, f
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if is_stepwise:
-            return K_global, F_global, hidden_states_out
+            return (K_global, F_global,
+                    hidden_states_out,
+                    patch_stiffness_dict)
         else:
-            return K_global, F_global
+            return (K_global, F_global,
+                    patch_stiffness_dict)
     # -------------------------------------------------------------------------
     def solve_matpatch(
         self,
@@ -1553,6 +1562,9 @@ class FEM(ABC):
         patch_elem_per_dim: list | None = None,
         edge_type: str = 'all',
         edge_feature_type: tuple = ('edge_vector',),
+        is_export_stiffness: bool = False,
+        stiffness_output_dir: str | None = None,
+        patch_size_label: str | None = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | Tuple[
@@ -1753,22 +1765,29 @@ class FEM(ABC):
                 if torch.any(patch_mask):
                     # Get unique patch IDs and process all at once
                     patch_ids = torch.unique(is_mat_patch[patch_mask])
-                    # Call surrogate integration (returns global K and F)
+                    # Call surrogate integration
+                    # Returns global K, F, and per-patch
+                    # boundary stiffness dict
                     if is_stepwise:
-                        K_raw, F_int, hidden_state_out = \
+                        (K_raw, F_int,
+                         hidden_state_out,
+                         patch_k_dict) = \
                             self.surrogate_integrate_material(
                             model, u, n, du,
                             is_stepwise=is_stepwise,
                             patch_ids=patch_ids,
                             hidden_states=hidden_states_dict,
-                            edge_feature_type=edge_feature_type)
+                            edge_feature_type=
+                                edge_feature_type)
                     else:
-                        K_raw, F_int = \
+                        (K_raw, F_int,
+                         patch_k_dict) = \
                             self.surrogate_integrate_material(
                             model, u, n, du,
                             is_stepwise=is_stepwise,
                             patch_ids=patch_ids,
-                            edge_feature_type=edge_feature_type)
+                            edge_feature_type=
+                                edge_feature_type)
                     # Apply constraint elimination
                     self.K = \
                         self._apply_constraints_sparse(
@@ -1801,17 +1820,32 @@ class FEM(ABC):
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Check convergence
                 if res_norm < rtol * res_norm0 or res_norm < atol:
-                    # Update patch-specific hidden states with converged values
+                    # Update patch-specific hidden states
+                    # with converged values
                     if is_stepwise:
-                        # Update patch-specific hidden states 
-                        # with converged values
-                        # hidden_state_out contains the updated states for 
-                        # processed patches
                         for pid in patch_ids:
-                            patch_key = f"patch_{pid.item()}"
-                            # Update the patch-specific hidden states
-                            hidden_states_dict[patch_key] = hidden_state_out[
-                                patch_key]
+                            patch_key = \
+                                f"patch_{pid.item()}"
+                            hidden_states_dict[
+                                patch_key] = \
+                                hidden_state_out[
+                                    patch_key]
+                    # Save converged per-patch stiffness
+                    if (is_export_stiffness
+                            and stiffness_output_dir):
+                        import os
+                        for pid, k_mat in \
+                                patch_k_dict.items():
+                            fname = (
+                                f'stiffness_'
+                                f'{patch_size_label}'
+                                f'_id{pid}'
+                                f'_inc{n}.npy')
+                            np.save(
+                                os.path.join(
+                                    stiffness_output_dir,
+                                    fname),
+                                k_mat.cpu().numpy())
                     break
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Use cached solve from previous iteration if available
