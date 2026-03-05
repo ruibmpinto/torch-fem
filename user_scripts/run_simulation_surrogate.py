@@ -41,7 +41,10 @@ from torchfem.materials import (
 from torchfem.mesh import cube_hexa, rect_quad
 from torchfem.elements import linear_to_quadratic
 
-from utils.boundary_conditons import prescribe_disps_by_coords
+from utils.boundary_conditons import \
+    prescribe_disps_by_coords
+from utils.plotting import plot_boundary_overlay, \
+    plot_boundary_panels, plot_boundary_error_overlay
 
 # Matplotlib.pyplot default parameters
 plt.rcParams.update({
@@ -323,7 +326,7 @@ def run_simulation_surrogate(
     if material_behavior == 'elastoplastic':
         increments_ref = torch.linspace(0.0, 1.0, 51)
     else:
-        increments_ref = torch.linspace(0.0, 1.0, 5)
+        increments_ref = torch.linspace(0.0, 1.0, 11)
 
     # Profile solve method
     profiler_solve = cProfile.Profile()
@@ -401,7 +404,7 @@ def run_simulation_surrogate(
         # One step for elastic sim
         # increments = torch.tensor([0.0, 1.0])
         # is_stepwise = False
-        increments = torch.linspace(0.0, 1.0, 5)
+        increments = torch.linspace(0.0, 1.0, 11)
         # RNN-like behavior
         is_stepwise = False 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -481,7 +484,8 @@ def run_simulation_surrogate(
         output_dir, 'stiffness')
     os.makedirs(stiffness_dir, exist_ok=True)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    u, f, _, _, _ = domain.solve_matpatch(
+    u, f, _, _, _, residual_history = \
+        domain.solve_matpatch(
         is_mat_patch=is_mat_patch,
         increments=increments,
         max_iter=100,
@@ -489,6 +493,7 @@ def run_simulation_surrogate(
         verbose=True,
         return_intermediate=True,
         return_volumes=False,
+        return_resnorm=True,
         is_stepwise=is_stepwise,
         model_directory=model_path,
         patch_boundary_nodes=patch_boundary_nodes_dict,
@@ -512,6 +517,24 @@ def run_simulation_surrogate(
     # print("="*60)
     # stats = pstats.Stats(profiler)
     # stats.sort_stats('cumulative').print_stats(15)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Save residual history to CSV
+    residual_dir = os.path.join(output_dir, 'residual')
+    os.makedirs(residual_dir, exist_ok=True)
+    for inc, norms in residual_history.items():
+        res0 = norms[0] if norms[0] > 0 else 1.0
+        rows = np.column_stack((
+            np.arange(len(norms)),
+            np.array(norms),
+            np.array(norms) / res0))
+        np.savetxt(
+            os.path.join(
+                residual_dir,
+                f'residual_inc{inc}.csv'),
+            rows,
+            delimiter=',',
+            header='iteration,absolute,relative',
+            comments='')
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Save results
     results = {
@@ -631,17 +654,50 @@ def run_simulation_surrogate(
     plot_path = os.path.join(output_dir, "force_field_difference.png")
     plt.savefig(plot_path)
     plt.close()
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Boundary-only displacement plots
+    plot_boundary_overlay(
+        nodes=domain.nodes,
+        elements=domain.elements,
+        u_surrogate=u[-1],
+        patch_boundary_nodes_dict=
+            patch_boundary_nodes_dict,
+        output_path=os.path.join(
+            output_dir,
+            'boundary_disp_overlay.png'))
+
+    plot_boundary_panels(
+        nodes=domain.nodes,
+        elements=domain.elements,
+        u_surrogate=u[-1],
+        patch_boundary_nodes_dict=
+            patch_boundary_nodes_dict,
+        output_path=os.path.join(
+            output_dir,
+            'boundary_disp_panels.png'),
+        u_reference=u_ref[-1])
+
+    plot_boundary_error_overlay(
+        nodes=domain.nodes,
+        elements=domain.elements,
+        u_surrogate=u[-1],
+        u_reference=u_ref[-1],
+        patch_boundary_nodes_dict=
+            patch_boundary_nodes_dict,
+        output_path=os.path.join(
+            output_dir,
+            'boundary_error_overlay.png'))
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
     # 8x8 patch on 16x16 mesh (L=1, baseline / no-regression)
     run_simulation_surrogate(
         element_type='quad4',
         material_behavior='elastic',
-        mesh_nx=12,
-        mesh_ny=12,
+        mesh_nx=8,
+        mesh_ny=8,
         mesh_nz=1,
-        patch_size_x=3,
-        patch_size_y=3,
+        patch_size_x=2,
+        patch_size_y=2,
         edge_type='all',
         edge_feature_type=('edge_vector', 'rel_disp'))
     # 2x2 patch on 16x16 mesh (L=0.125, centering test)
