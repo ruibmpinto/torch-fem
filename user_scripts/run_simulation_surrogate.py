@@ -690,24 +690,23 @@ def run_simulation_surrogate(
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
     # 8x8 patch on 16x16 mesh (L=1, baseline / no-regression)
-    run_simulation_surrogate(
-        element_type='quad4',
-        material_behavior='elastic',
-        mesh_nx=8,
-        mesh_ny=8,
-        mesh_nz=1,
-        patch_size_x=2,
-        patch_size_y=2,
-        edge_type='all',
-        edge_feature_type=('edge_vector', 'rel_disp'))
-    # 2x2 patch on 16x16 mesh (L=0.125, centering test)
-    # run_simulation_surrogate(
-    #     element_type='quad4',
-    #     material_behavior='elastic',
-    #     mesh_nx=16,
-    #     mesh_ny=16,
-    #     mesh_nz=1,
-    #     patch_size_x=2,
-    #     patch_size_y=2,
-    #     edge_type='all',
-    #     edge_feature_type=('edge_vector', 'rel_disp'))
+    configs = [
+        (8, 2), (12, 3), (16, 4),
+        (20, 5), (24, 6), (28, 7), (32, 8),
+    ]
+    for mesh_n, patch_n in configs:
+        print(f'\n{"=" * 60}')
+        print(f'mesh {mesh_n}x{mesh_n}, '
+              f'patch {patch_n}x{patch_n}')
+        print(f'{"=" * 60}')
+        run_simulation_surrogate(
+            element_type='quad4',
+            material_behavior='elastic',
+            mesh_nx=mesh_n,
+            mesh_ny=mesh_n,
+            mesh_nz=1,
+            patch_size_x=patch_n,
+            patch_size_y=patch_n,
+            edge_type='all',
+            edge_feature_type=(
+                'edge_vector', 'rel_disp'))
