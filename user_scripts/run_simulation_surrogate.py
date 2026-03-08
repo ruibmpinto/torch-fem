@@ -73,9 +73,11 @@ def run_simulation_surrogate(
     element_type='quad4',
     material_behavior='elastic',
     mesh_nx=1, mesh_ny=1, mesh_nz=1,
-    patch_size_x=1, patch_size_y=1, patch_size_z=1,
+    patch_size_x=1, patch_size_y=1,
+    patch_size_z=1,
     model_path=None, edge_type='all',
-    edge_feature_type=('edge_vector',)):
+    edge_feature_type=('edge_vector',),
+    fe_border=0):
     """
     Run simulation using solve_matpatch function with Graphorge surrogate model
     """
@@ -215,82 +217,131 @@ def run_simulation_surrogate(
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Meshing with material patches
     # Calculate number of patches based on patch size
-    num_patches_x = mesh_nx // patch_size_x
-    num_patches_y = mesh_ny // patch_size_y
-    # Map each element to its patch ID
-    is_mat_patch = torch.zeros(num_elements, dtype=torch.int)
+    # fe_border: number of element layers at domain
+    # boundary that use standard FE integration.
+    # Elements inside the border use surrogates.
+    surr_nx = mesh_nx - 2 * fe_border
+    surr_ny = mesh_ny - 2 * fe_border
+    num_patches_x = surr_nx // patch_size_x
+    num_patches_y = surr_ny // patch_size_y
+    # Map each element to its patch ID or -1 (FE)
+    is_mat_patch = torch.full(
+        (num_elements,), -1, dtype=torch.int)
     for elem_idx in range(num_elements):
-        # Determine element's (i,j) position in the grid
         elem_i = elem_idx // mesh_nx
         elem_j = elem_idx % mesh_nx
-        # Determine which patch this element belongs to
-        patch_i = elem_i // patch_size_y
-        patch_j = elem_j // patch_size_x
-        # Assign patch ID (linearized patch index)
-        patch_id = patch_i * num_patches_x + patch_j
-        is_mat_patch[elem_idx] = patch_id
+        # Check if element is in surrogate region
+        if (fe_border <= elem_i
+                < mesh_ny - fe_border
+                and fe_border <= elem_j
+                < mesh_nx - fe_border):
+            patch_i = (
+                (elem_i - fe_border)
+                // patch_size_y)
+            patch_j = (
+                (elem_j - fe_border)
+                // patch_size_x)
+            patch_id = (
+                patch_i * num_patches_x
+                + patch_j)
+            is_mat_patch[elem_idx] = patch_id
 
     # Identify boundary nodes of material patches
-    # Build node-to-patches mapping
+    # Build node-to-patches mapping (only patch elems)
     node_to_patches = {}
     for elem_idx in range(num_elements):
         patch_id = is_mat_patch[elem_idx].item()
-        elem_nodes = elements[elem_idx, :4].tolist()
+        if patch_id < 0:
+            continue
+        elem_nodes = elements[
+            elem_idx, :4].tolist()
         for node_id in elem_nodes:
             if node_id not in node_to_patches:
                 node_to_patches[node_id] = set()
             node_to_patches[node_id].add(patch_id)
-
-    # Identify external boundary nodes (on global domain boundary)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Collect nodes belonging to FE elements
+    fe_nodes = set()
+    for elem_idx in range(num_elements):
+        if is_mat_patch[elem_idx].item() == -1:
+            for nid in elements[
+                    elem_idx, :4].tolist():
+                fe_nodes.add(nid)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Identify external boundary nodes
     external_boundary_nodes = set()
     for i, node_coord in enumerate(nodes):
         tol = 1e-6
         if dim == 2:
             on_boundary = (
-                torch.abs(node_coord[0]) < tol or
-                torch.abs(node_coord[0] - 1.0) < tol or
-                torch.abs(node_coord[1]) < tol or
-                torch.abs(node_coord[1] - 1.0) < tol
-            )
+                torch.abs(node_coord[0]) < tol
+                or torch.abs(
+                    node_coord[0] - 1.0) < tol
+                or torch.abs(
+                    node_coord[1]) < tol
+                or torch.abs(
+                    node_coord[1] - 1.0) < tol)
         elif dim == 3:
             on_boundary = (
-                torch.abs(node_coord[0]) < tol or
-                torch.abs(node_coord[0] - 1.0) < tol or
-                torch.abs(node_coord[1]) < tol or
-                torch.abs(node_coord[1] - 1.0) < tol or
-                torch.abs(node_coord[2]) < tol or
-                torch.abs(node_coord[2] - 1.0) < tol
-            )
+                torch.abs(node_coord[0]) < tol
+                or torch.abs(
+                    node_coord[0] - 1.0) < tol
+                or torch.abs(
+                    node_coord[1]) < tol
+                or torch.abs(
+                    node_coord[1] - 1.0) < tol
+                or torch.abs(
+                    node_coord[2]) < tol
+                or torch.abs(
+                    node_coord[2] - 1.0) < tol)
         if on_boundary:
             external_boundary_nodes.add(i)
-
-    # Patch boundary nodes: nodes shared by multiple patches OR
-    # on external boundary
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Patch boundary nodes: shared between patches,
+    # on external boundary, or touching FE region
     patch_boundary_nodes = []
-    for node_id, patches in node_to_patches.items():
-        if len(patches) > 1 or node_id in external_boundary_nodes:
+    for node_id in node_to_patches:
+        patches = node_to_patches[node_id]
+        is_boundary = (
+            len(patches) > 1
+            or node_id in external_boundary_nodes
+            or node_id in fe_nodes)
+        if is_boundary:
             patch_boundary_nodes.append(node_id)
-
     patch_boundary_nodes = torch.tensor(
-        sorted(patch_boundary_nodes), dtype=torch.long)
-
-    # Identify internal patch nodes (all nodes except boundary nodes)
-    all_nodes = set(range(len(nodes)))
-    patch_internal_nodes = all_nodes - set(patch_boundary_nodes.tolist())
+        sorted(patch_boundary_nodes),
+        dtype=torch.long)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Internal patch nodes: in a patch, not boundary,
+    # not part of any FE element
+    all_patch_nodes = set(node_to_patches.keys())
+    patch_internal_nodes = (
+        all_patch_nodes
+        - set(patch_boundary_nodes.tolist())
+        - fe_nodes)
     patch_internal_nodes = torch.tensor(
-        sorted(list(patch_internal_nodes)), dtype=torch.long)
+        sorted(list(patch_internal_nodes)),
+        dtype=torch.long)
 
-    # Build patch_boundary_nodes_dict: patch_id → boundary node indices
+    # Build patch_boundary_nodes_dict:
+    # patch_id -> boundary node indices
     patch_boundary_nodes_dict = {}
-    for patch_id in range(num_patches_x * num_patches_y):
+    n_patches = num_patches_x * num_patches_y
+    for patch_id in range(n_patches):
         patch_boundary_set = set()
-        for node_id, patches in node_to_patches.items():
+        for node_id, patches in (
+                node_to_patches.items()):
             if patch_id in patches:
-                if (len(patches) > 1 or
-                        node_id in external_boundary_nodes):
-                    patch_boundary_set.add(node_id)
-        patch_boundary_nodes_dict[patch_id] = torch.tensor(
-            sorted(list(patch_boundary_set)), dtype=torch.long)
+                if (len(patches) > 1
+                        or node_id
+                        in external_boundary_nodes
+                        or node_id in fe_nodes):
+                    patch_boundary_set.add(
+                        node_id)
+        patch_boundary_nodes_dict[
+            patch_id] = torch.tensor(
+            sorted(list(patch_boundary_set)),
+            dtype=torch.long)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Boundary conditions
     # # OLD: Load boundary conditions from material patch file (1x1 only)
@@ -689,24 +740,16 @@ def run_simulation_surrogate(
             'boundary_error_overlay.png'))
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
-    # 8x8 patch on 16x16 mesh (L=1, baseline / no-regression)
-    configs = [
-        (8, 2), (12, 3), (16, 4),
-        (20, 5), (24, 6), (28, 7), (32, 8),
-    ]
-    for mesh_n, patch_n in configs:
-        print(f'\n{"=" * 60}')
-        print(f'mesh {mesh_n}x{mesh_n}, '
-              f'patch {patch_n}x{patch_n}')
-        print(f'{"=" * 60}')
-        run_simulation_surrogate(
-            element_type='quad4',
-            material_behavior='elastic',
-            mesh_nx=mesh_n,
-            mesh_ny=mesh_n,
-            mesh_nz=1,
-            patch_size_x=patch_n,
-            patch_size_y=patch_n,
-            edge_type='all',
-            edge_feature_type=(
-                'edge_vector', 'rel_disp'))
+    # Hybrid mesh: 1-element FE border + surrogates
+    run_simulation_surrogate(
+        element_type='quad4',
+        material_behavior='elastic',
+        mesh_nx=12,
+        mesh_ny=12,
+        mesh_nz=1,
+        patch_size_x=2,
+        patch_size_y=2,
+        edge_type='all',
+        edge_feature_type=(
+            'edge_vector', 'rel_disp'),
+        fe_border=1)

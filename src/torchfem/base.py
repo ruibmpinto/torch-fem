@@ -361,8 +361,100 @@ class FEM(ABC):
                 k += w * self.compute_k(detJ, kg)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return k, f
-    # ------------------------------------------------------------------------- 
-    def _load_Graphorge_model(self, model_directory: str, 
+    # -----------------------------------------------------------------
+    def _integrate_fe_subset(
+            self, fe_indices, u, defgrad, stress,
+            state, n, du, de0, nlgeom):
+        """Integrate a subset of elements using FE.
+
+        Temporarily swaps mesh attributes to the FE
+        subset, calls integrate_material + assembly,
+        then restores originals.
+
+        Args:
+            fe_indices (Tensor): Element indices for
+                standard FE integration.
+            u (Tensor): Displacement history.
+            defgrad (Tensor): Deformation gradient.
+            stress (Tensor): Stress history.
+            state (Tensor): State variable history.
+            n (int): Current increment number.
+            du (Tensor): Displacement increment.
+            de0 (Tensor): External strain increment.
+            nlgeom (bool): Nonlinear geometry flag.
+
+        Returns:
+            Tuple[Tensor, Tensor]: Raw global sparse
+                stiffness (no constraints applied) and
+                global force vector.
+        """
+        # Subset state arrays (axis 2 = elements)
+        defgrad_fe = defgrad[:, :, fe_indices].clone()
+        stress_fe = stress[:, :, fe_indices].clone()
+        state_fe = state[
+            :, :, fe_indices].clone()
+        de0_fe = de0[fe_indices]
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Save original attributes
+        orig_elements = self.elements
+        orig_idx = self.idx
+        orig_n_elem = self.n_elem
+        orig_material = self.material
+        orig_ext_strain = self.ext_strain
+        orig_K = self.K
+        orig_thickness = getattr(
+            self, 'thickness', None)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Swap to FE subset
+        self.elements = orig_elements[fe_indices]
+        n_dim = self.n_dim
+        idx = (n_dim * self.elements).unsqueeze(
+            -1) + torch.arange(n_dim)
+        self.idx = idx.reshape(
+            len(fe_indices), -1).to(torch.int32)
+        self.n_elem = len(fe_indices)
+        if orig_material.is_vectorized:
+            self.material = copy.copy(
+                orig_material)
+            self.material.C = (
+                orig_material.C[fe_indices])
+        self.ext_strain = orig_ext_strain[
+            fe_indices]
+        if orig_thickness is not None:
+            self.thickness = orig_thickness[
+                fe_indices]
+        # Force stiffness recomputation
+        self.K = torch.empty(0)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Integrate
+        k_fe, f_fe = self.integrate_material(
+            u, defgrad_fe, stress_fe, state_fe,
+            n, du, de0_fe, nlgeom)
+        # Assemble raw K (no constraint elimination)
+        con_empty = torch.tensor(
+            [], dtype=torch.int32)
+        K_fe = self.assemble_stiffness(
+            k_fe, con_empty)
+        F_fe = self.assemble_force(f_fe)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Restore original attributes
+        self.elements = orig_elements
+        self.idx = orig_idx
+        self.n_elem = orig_n_elem
+        self.material = orig_material
+        self.ext_strain = orig_ext_strain
+        self.K = orig_K
+        if orig_thickness is not None:
+            self.thickness = orig_thickness
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Write back updated state arrays
+        defgrad[:, :, fe_indices] = defgrad_fe
+        stress[:, :, fe_indices] = stress_fe
+        state[:, :, fe_indices] = state_fe
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        return K_fe, F_fe
+    # -----------------------------------------------------------------
+    def _load_Graphorge_model(self, model_directory: str,
                               device_type: str = 'cpu'):
         """Load and configure Graphorge material patch model.
         
@@ -1661,8 +1753,14 @@ class FEM(ABC):
         # Initialize displacement increment
         du = torch.zeros_like(self.nodes).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Initialize material patch data structures for surrogate integration
-        patch_mask = is_mat_patch >= 0
+        # Classify elements: FE vs surrogate
+        fe_mask = (is_mat_patch == -1)
+        patch_mask = (is_mat_patch >= 0)
+        has_fe = torch.any(fe_mask).item()
+        has_surr = torch.any(patch_mask).item()
+        fe_indices = None
+        if has_fe:
+            fe_indices = torch.where(fe_mask)[0]
         model = None
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Load surrogate model
@@ -1752,56 +1850,65 @@ class FEM(ABC):
             # Newton-Raphson iterations
             for i in range(max_iter):
                 du[con] = DU[con]
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # # OLD: Element-wise integration with material patch support
-                # # Initialize element stiffness and force arrays
-                # n_nod = self.etype.nodes
-                # k = torch.zeros((self.n_elem, self.n_dim * n_nod,
-                #                  self.n_dim * n_nod))
-                # f_i = torch.zeros(self.n_elem, self.n_dim * n_nod)
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Surrogate integration returns global K and F
-                patch_mask = is_mat_patch >= 0
-                if torch.any(patch_mask):
-                    # Get unique patch IDs and process all at once
-                    patch_ids = torch.unique(is_mat_patch[patch_mask])
-                    # Call surrogate integration
-                    # Returns global K, F, and per-patch
-                    # boundary stiffness dict
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # FE integration (regular elements)
+                K_fe = None
+                F_fe = None
+                if has_fe:
+                    K_fe, F_fe = (
+                        self._integrate_fe_subset(
+                            fe_indices, u, defgrad,
+                            stress, state, n, du,
+                            de0, nlgeom))
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Surrogate integration (patch elements)
+                K_surr = None
+                F_surr = None
+                patch_k_dict = {}
+                hidden_state_out = None
+                if has_surr:
+                    patch_ids = torch.unique(
+                        is_mat_patch[patch_mask])
                     if is_stepwise:
-                        (K_raw, F_int,
+                        (K_surr, F_surr,
                          hidden_state_out,
                          patch_k_dict) = \
-                            self.surrogate_integrate_material(
+                            self \
+                            .surrogate_integrate_material(
                             model, u, n, du,
                             is_stepwise=is_stepwise,
                             patch_ids=patch_ids,
-                            hidden_states=hidden_states_dict,
+                            hidden_states=
+                                hidden_states_dict,
                             edge_feature_type=
                                 edge_feature_type)
                     else:
-                        (K_raw, F_int,
+                        (K_surr, F_surr,
                          patch_k_dict) = \
-                            self.surrogate_integrate_material(
+                            self \
+                            .surrogate_integrate_material(
                             model, u, n, du,
                             is_stepwise=is_stepwise,
                             patch_ids=patch_ids,
                             edge_feature_type=
                                 edge_feature_type)
-                    # Apply constraint elimination
-                    self.K = \
-                        self._apply_constraints_sparse(
-                            K_raw, con)
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # # OLD: Assemble results for all patches
-                # k[patch_mask] = k_surr[patch_mask]
-                # f_i[patch_mask] = f_surr[patch_mask]
-                # # OLD: Assemble global stiffness matrix and internal force
-                # if self.K.numel() == 0 or not self.material.n_state == 0 or \
-                #     nlgeom:
-                #     self.K = self.assemble_stiffness(k, con)
-                # F_int = self.assemble_force(f_i)
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Combine FE and surrogate contributions
+                if has_fe and has_surr:
+                    K_combined = (
+                        K_fe + K_surr).coalesce()
+                    F_int = F_fe + F_surr
+                elif has_fe:
+                    K_combined = K_fe
+                    F_int = F_fe
+                else:
+                    K_combined = K_surr
+                    F_int = F_surr
+                # Apply constraint elimination
+                self.K = (
+                    self._apply_constraints_sparse(
+                        K_combined, con))
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Compute residual
                 residual = F_int - F_ext
                 residual[con] = 0.0
