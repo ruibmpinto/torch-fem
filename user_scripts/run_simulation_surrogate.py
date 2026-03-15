@@ -178,7 +178,7 @@ def run_simulation_surrogate(
 
         sigma_y = 100.0
         hardening_modulus = 100.0
-        
+
         # Hardening function
         def sigma_f(q):
             return sigma_y + hardening_modulus * q
@@ -186,18 +186,65 @@ def run_simulation_surrogate(
         # Derivative of the hardening function
         def sigma_f_prime(q):
             return hardening_modulus
-        
+
         if dim == 2:
-            # Remember:
-            # state (Tensor): Internal state variables, here: 
-            # equivalent plastic strain and stress in the third direction. 
-            # Shape: `(..., 2)`.
             material = IsotropicPlasticityPlaneStrain(
-                E=e_young, nu=nu, sigma_f=sigma_f, 
+                E=e_young, nu=nu, sigma_f=sigma_f,
                 sigma_f_prime=sigma_f_prime)
         elif dim == 3:
             material = IsotropicPlasticity3D(
-                E=e_young, nu=nu, sigma_f=sigma_f, 
+                E=e_young, nu=nu, sigma_f=sigma_f,
+                sigma_f_prime=sigma_f_prime)
+
+    elif material_behavior == 'elastoplastic_nlh':
+
+        e_young = 70000
+        nu = 0.33
+
+        # Swift-Voce hardening parameters for AA2024
+        a_s = 798.56    # MPa
+        epsilon_0 = 0.0178
+        n_sv = 0.202
+        k_0 = 363.84    # MPa
+        q_v = 240.03     # MPa
+        beta = 10.533
+        omega = 0.368
+
+        def k_s(eps_pl):
+            """Swift hardening component."""
+            return a_s * (epsilon_0 + eps_pl)**n_sv
+
+        def k_v(eps_pl):
+            """Voce hardening component."""
+            return (
+                k_0
+                + q_v * (1.0 - torch.exp(-beta * eps_pl)))
+
+        def sigma_f(eps_pl):
+            """Combined Swift-Voce hardening."""
+            return (
+                omega * k_s(eps_pl)
+                + (1.0 - omega) * k_v(eps_pl))
+
+        def sigma_f_prime(eps_pl):
+            """Derivative of Swift-Voce hardening."""
+            dks = (
+                a_s * n_sv
+                * (epsilon_0 + eps_pl)**(n_sv - 1.0))
+            dkv = (
+                q_v * beta
+                * torch.exp(-beta * eps_pl))
+            return (
+                omega * dks
+                + (1.0 - omega) * dkv)
+
+        if dim == 2:
+            material = IsotropicPlasticityPlaneStrain(
+                E=e_young, nu=nu, sigma_f=sigma_f,
+                sigma_f_prime=sigma_f_prime)
+        elif dim == 3:
+            material = IsotropicPlasticity3D(
+                E=e_young, nu=nu, sigma_f=sigma_f,
                 sigma_f_prime=sigma_f_prime)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Geometry & mesh
@@ -265,7 +312,8 @@ def run_simulation_surrogate(
         model_directory_map = {}
         for res in unique_res:
             ps = f'{res[0]}x{res[1]}'
-            if material_behavior == 'elastoplastic':
+            if material_behavior in (
+                    'elastoplastic', 'elastoplastic_nlh'):
                 model_directory_map[res] = (
                     os.path.join(
                         surrogates_dir,
@@ -282,7 +330,8 @@ def run_simulation_surrogate(
         # Single resolution -- pass str for compat
         res = list(unique_res)[0]
         ps = f'{res[0]}x{res[1]}'
-        if material_behavior == 'elastoplastic':
+        if material_behavior in (
+                'elastoplastic', 'elastoplastic_nlh'):
             model_directory_map = os.path.join(
                 surrogates_dir,
                 'elastoplastic_nlh', ps, 'model')
@@ -430,7 +479,7 @@ def run_simulation_surrogate(
     # Compute reference solution WITHOUT internal node constraints
     # (all nodes free to move)
     print_status("BEFORE_SOLVE")
-    if material_behavior == 'elastoplastic':
+    if material_behavior in ('elastoplastic', 'elastoplastic_nlh'):
         increments_ref = torch.linspace(0.0, 1.0, 51)
     else:
         increments_ref = torch.linspace(0.0, 1.0, 11)
@@ -503,7 +552,7 @@ def run_simulation_surrogate(
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Solver
     # Create more increments for elastoplastic simulation
-    if material_behavior == 'elastoplastic':
+    if material_behavior in ('elastoplastic', 'elastoplastic_nlh'):
         increments = torch.linspace(0.0, 1.0, 51)
         # RNN-like behavior
         is_stepwise = True 
@@ -805,15 +854,15 @@ if __name__ == '__main__':
     # Bot-right 4x4 block -> one 4x4 patch
     run_simulation_surrogate(
         element_type='quad4',
-        material_behavior='elastic',
-        mesh_nx=20,
-        mesh_ny=20,
+        material_behavior='elastoplastic_nlh',
+        mesh_nx=4,
+        mesh_ny=4,
         edge_type='all',
         edge_feature_type=(
-            'edge_vector'),
+            'edge_vector', 'relative_disp'),
         # fe_border=0,
-        patch_size_x=5,
-        patch_size_y=5
+        patch_size_x=1,
+        patch_size_y=1
         # patch_zones=[
         #     # Top-left 4x4: rows 0-3, cols 0-3
         #     {'region': (0, 4, 0, 4),

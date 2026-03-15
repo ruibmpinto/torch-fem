@@ -1786,24 +1786,12 @@ class FEM(ABC):
                         self._load_Graphorge_model(
                             model_directory=path,
                             device_type=dev))
-            # else:
-            #     # Single model (backward compat)
-            #     if model_directory is None:
-            #         model_directory = (
-            #             '/Users/rbarreira/Desktop/'
-            #             'machine_learning/'
-            #             'material_patches/'
-            #             'graphorge_material_patches/'
-            #             'src/graphorge/projects/'
-            #             'material_patches/elastic/'
-            #             '2d/quad4/mesh1x1/ninc1/'
-            #             '26.1_force_equilibrium_'
-            #             'npath10000/reference/'
-            #             '3_model')
-            #     model_cache['default'] = (
-            #         self._load_Graphorge_model(
-            #             model_directory=model_directory,
-            #             device_type=dev))
+            else:
+                # Single model (backward compat)
+                model_cache['default'] = (
+                    self._load_Graphorge_model(
+                        model_directory=model_directory,
+                        device_type=dev))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Enable stepwise mode on all cached models
             if is_stepwise:
