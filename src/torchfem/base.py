@@ -361,8 +361,100 @@ class FEM(ABC):
                 k += w * self.compute_k(detJ, kg)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return k, f
-    # ------------------------------------------------------------------------- 
-    def _load_Graphorge_model(self, model_directory: str, 
+    # -----------------------------------------------------------------
+    def _integrate_fe_subset(
+            self, fe_indices, u, defgrad, stress,
+            state, n, du, de0, nlgeom):
+        """Integrate a subset of elements using FE.
+
+        Temporarily swaps mesh attributes to the FE
+        subset, calls integrate_material + assembly,
+        then restores originals.
+
+        Args:
+            fe_indices (Tensor): Element indices for
+                standard FE integration.
+            u (Tensor): Displacement history.
+            defgrad (Tensor): Deformation gradient.
+            stress (Tensor): Stress history.
+            state (Tensor): State variable history.
+            n (int): Current increment number.
+            du (Tensor): Displacement increment.
+            de0 (Tensor): External strain increment.
+            nlgeom (bool): Nonlinear geometry flag.
+
+        Returns:
+            Tuple[Tensor, Tensor]: Raw global sparse
+                stiffness (no constraints applied) and
+                global force vector.
+        """
+        # Subset state arrays (axis 2 = elements)
+        defgrad_fe = defgrad[:, :, fe_indices].clone()
+        stress_fe = stress[:, :, fe_indices].clone()
+        state_fe = state[
+            :, :, fe_indices].clone()
+        de0_fe = de0[fe_indices]
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Save original attributes
+        orig_elements = self.elements
+        orig_idx = self.idx
+        orig_n_elem = self.n_elem
+        orig_material = self.material
+        orig_ext_strain = self.ext_strain
+        orig_K = self.K
+        orig_thickness = getattr(
+            self, 'thickness', None)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Swap to FE subset
+        self.elements = orig_elements[fe_indices]
+        n_dim = self.n_dim
+        idx = (n_dim * self.elements).unsqueeze(
+            -1) + torch.arange(n_dim)
+        self.idx = idx.reshape(
+            len(fe_indices), -1).to(torch.int32)
+        self.n_elem = len(fe_indices)
+        if orig_material.is_vectorized:
+            self.material = copy.copy(
+                orig_material)
+            self.material.C = (
+                orig_material.C[fe_indices])
+        self.ext_strain = orig_ext_strain[
+            fe_indices]
+        if orig_thickness is not None:
+            self.thickness = orig_thickness[
+                fe_indices]
+        # Force stiffness recomputation
+        self.K = torch.empty(0)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Integrate
+        k_fe, f_fe = self.integrate_material(
+            u, defgrad_fe, stress_fe, state_fe,
+            n, du, de0_fe, nlgeom)
+        # Assemble raw K (no constraint elimination)
+        con_empty = torch.tensor(
+            [], dtype=torch.int32)
+        K_fe = self.assemble_stiffness(
+            k_fe, con_empty)
+        F_fe = self.assemble_force(f_fe)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Restore original attributes
+        self.elements = orig_elements
+        self.idx = orig_idx
+        self.n_elem = orig_n_elem
+        self.material = orig_material
+        self.ext_strain = orig_ext_strain
+        self.K = orig_K
+        if orig_thickness is not None:
+            self.thickness = orig_thickness
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Write back updated state arrays
+        defgrad[:, :, fe_indices] = defgrad_fe
+        stress[:, :, fe_indices] = stress_fe
+        state[:, :, fe_indices] = state_fe
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        return K_fe, F_fe
+    # -----------------------------------------------------------------
+    def _load_Graphorge_model(self, model_directory: str,
                               device_type: str = 'cpu'):
         """Load and configure Graphorge material patch model.
         
@@ -1283,11 +1375,14 @@ class FEM(ABC):
         self._edges_indexes[f"patch_{patch_id}"] = edges_indexes
     # -------------------------------------------------------------------------
     def surrogate_integrate_material(
-        self, model, u: Tensor, n: int, du: Tensor,
+        self, model, u: Tensor, n: int,
+        du: Tensor,
         is_stepwise: bool = False,
         patch_ids: Tensor = None,
         hidden_states: dict = None,
         edge_feature_type: tuple = ('edge_vector',),
+        model_cache: dict = None,
+        patch_resolution: dict = None,
     ) -> Tuple[Tensor, Tensor]:
         """Perform surrogate integration using Graphorge material patch model.
 
@@ -1334,6 +1429,8 @@ class FEM(ABC):
         # Sparse stiffness assembly (COO format)
         k_indices = []
         k_values = []
+        # Per-patch boundary stiffness matrices
+        patch_stiffness_dict = {}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # # OLD: Initialize nodal force and stiffness
         # n_nod = self.etype.nodes
@@ -1349,6 +1446,13 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Loop over patches
         for idx_patch in patch_indices:
+            # Select model for this patch
+            if (model_cache is not None
+                    and patch_resolution is not None):
+                res = patch_resolution[idx_patch]
+                model = model_cache[res]
+            elif model_cache is not None:
+                model = model_cache['default']
             # Get patch identifier for stepwise mode
             patch_id = f"patch_{idx_patch}"
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1468,8 +1572,12 @@ class FEM(ABC):
             (jacobian, boundary_forces) = torch_func.jacfwd(
                 forward, has_aux=True)(boundary_u_current)
             # Stiffness shape: (n_boundary*dim, n_boundary*dim)
-            k_boundary = jacobian.view(n_dof_boundary, n_dof_boundary)
+            k_boundary = jacobian.view(
+                n_dof_boundary, n_dof_boundary)
             f_boundary = boundary_forces.flatten()
+            # Store per-patch boundary stiffness
+            patch_stiffness_dict[idx_patch] = \
+                k_boundary.detach().clone()
 
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # # OLD: Compute Jacobian for all element nodes
@@ -1526,9 +1634,12 @@ class FEM(ABC):
         #     return k, f
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if is_stepwise:
-            return K_global, F_global, hidden_states_out
+            return (K_global, F_global,
+                    hidden_states_out,
+                    patch_stiffness_dict)
         else:
-            return K_global, F_global
+            return (K_global, F_global,
+                    patch_stiffness_dict)
     # -------------------------------------------------------------------------
     def solve_matpatch(
         self,
@@ -1547,12 +1658,16 @@ class FEM(ABC):
         nlgeom: bool = False,
         return_volumes: bool = False,
         is_stepwise: bool = False,
-        model_directory: str | None = None,
+        model_directory: str | dict | None = None,
         return_resnorm: bool = False,
         patch_boundary_nodes: dict | None = None,
-        patch_elem_per_dim: list | None = None,
+        patch_elem_per_dim: list | dict | None = None,
+        patch_resolution: dict | None = None,
         edge_type: str = 'all',
         edge_feature_type: tuple = ('edge_vector',),
+        is_export_stiffness: bool = False,
+        stiffness_output_dir: str | None = None,
+        patch_size_label: str | None = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | Tuple[
@@ -1649,82 +1764,106 @@ class FEM(ABC):
         # Initialize displacement increment
         du = torch.zeros_like(self.nodes).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Initialize material patch data structures for surrogate integration
-        patch_mask = is_mat_patch >= 0
-        model = None
+        # Classify elements: FE vs surrogate
+        fe_mask = (is_mat_patch == -1)
+        patch_mask = (is_mat_patch >= 0)
+        has_fe = torch.any(fe_mask).item()
+        has_surr = torch.any(patch_mask).item()
+        fe_indices = None
+        if has_fe:
+            fe_indices = torch.where(fe_mask)[0]
+        model_cache = {}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Load surrogate model
+        # Load surrogate model(s)
         if torch.any(patch_mask):
-            # Use provided model directory or default path
-            if model_directory is None:
-                model_directory = (
-                    "/Users/rbarreira/Desktop/machine_learning/material_patches/"
-                    "graphorge_material_patches/src/graphorge/projects/"
-                    "material_patches/elastic/2d/quad4/mesh1x1/ninc1/"
-                    "26.1_force_equilibrium_npath10000/reference/3_model")
-            model = self._load_Graphorge_model(
-                model_directory=model_directory,
-                device_type=device if device else 'cpu')
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Enable stepwise mode
-            # Temporarily set attributes for single-step mode (_n_time_* = 1)
+            dev = device if device else 'cpu'
+            if isinstance(model_directory, dict):
+                # Multi-resolution: dict keyed by
+                # resolution tuple -> model path
+                for res_key, path in (
+                        model_directory.items()):
+                    model_cache[res_key] = (
+                        self._load_Graphorge_model(
+                            model_directory=path,
+                            device_type=dev))
+            # else:
+            #     # Single model (backward compat)
+            #     if model_directory is None:
+            #         model_directory = (
+            #             '/Users/rbarreira/Desktop/'
+            #             'machine_learning/'
+            #             'material_patches/'
+            #             'graphorge_material_patches/'
+            #             'src/graphorge/projects/'
+            #             'material_patches/elastic/'
+            #             '2d/quad4/mesh1x1/ninc1/'
+            #             '26.1_force_equilibrium_'
+            #             'npath10000/reference/'
+            #             '3_model')
+            #     model_cache['default'] = (
+            #         self._load_Graphorge_model(
+            #             model_directory=model_directory,
+            #             device_type=dev))
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Enable stepwise mode on all cached models
             if is_stepwise:
-                # Store original attributes for stepwise data scaler access
-                # orig_attrs = 
-                model._save_time_series_attrs()
-                # model._original_time_attrs = orig_attrs
-                # Enable stepwise mode
-                model.set_rnn_mode(is_stepwise=True)
-            
-            # Initialize patch_id dictionary with None values
-            patch_ids = torch.unique(is_mat_patch[is_mat_patch >= 0])
-            # Initialize edges_indexes dict and patch boundary nodes dict
+                for m in model_cache.values():
+                    m._save_time_series_attrs()
+                    m.set_rnn_mode(is_stepwise=True)
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Initialize patch IDs and topology
+            patch_ids = torch.unique(
+                is_mat_patch[is_mat_patch >= 0])
             self._edges_indexes = {}
             self.patch_bd_nodes = {}
-            # Populate patch boundary nodes from input parameter
             if patch_boundary_nodes is not None:
-                self.patch_bd_nodes = patch_boundary_nodes
-            # Initialize hidden states dict before loop to accumulate all patches
+                self.patch_bd_nodes = (
+                    patch_boundary_nodes)
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Build graph topology and hidden states
+            # per patch (resolution-aware)
             hidden_states_dict = {}
             for pid in patch_ids:
                 pid_int = pid.item()
-                # Build graph topology for this material patch
+                # Resolve per-patch elem_per_dim
+                if isinstance(
+                        patch_elem_per_dim, dict):
+                    epd = patch_elem_per_dim[pid_int]
+                else:
+                    epd = patch_elem_per_dim
                 self._build_graph_topology(
-                    pid_int, patch_elem_per_dim,
+                    pid_int, epd,
                     edge_type=edge_type)
-                # Initialize hidden states structure for GNN model
-                # Same structure as graphorge:
-                # - encoder: for encoding layers
-                # - processor: for message passing layers (layer_0, layer_1, etc.)
-                # - decoder: for decoding layers
-                # Each layer can have node, edge, global hidden states
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Get number of message passing steps from model if available
-                n_message_steps = model._n_message_steps
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Create processor hidden states for each layer
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Select model for this patch's
+                # resolution to get n_message_steps
+                if patch_resolution is not None:
+                    res = patch_resolution[pid_int]
+                    m = model_cache[res]
+                else:
+                    m = model_cache['default']
+                n_msg = m._n_message_steps
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Create processor hidden states
                 processor_hidden = {}
-                for layer_idx in range(n_message_steps):
-                    processor_hidden[f'layer_{layer_idx}'] = {
+                for li in range(n_msg):
+                    processor_hidden[
+                        f'layer_{li}'] = {
                         'node': None,
                         'edge': None,
-                        'global': None
-                    }
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Accumulate hidden states for each patch
-                hidden_states_dict[f"patch_{pid_int}"] = {
+                        'global': None}
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                hidden_states_dict[
+                    f'patch_{pid_int}'] = {
                     'encoder': {
                         'node': None,
                         'edge': None,
-                        'global': None
-                    },
+                        'global': None},
                     'processor': processor_hidden,
                     'decoder': {
                         'node': None,
                         'edge': None,
-                        'global': None
-                    }
-                }
+                        'global': None}}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Incremental loading
         for n in range(1, N):
@@ -1740,49 +1879,68 @@ class FEM(ABC):
             # Newton-Raphson iterations
             for i in range(max_iter):
                 du[con] = DU[con]
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # # OLD: Element-wise integration with material patch support
-                # # Initialize element stiffness and force arrays
-                # n_nod = self.etype.nodes
-                # k = torch.zeros((self.n_elem, self.n_dim * n_nod,
-                #                  self.n_dim * n_nod))
-                # f_i = torch.zeros(self.n_elem, self.n_dim * n_nod)
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Surrogate integration returns global K and F
-                patch_mask = is_mat_patch >= 0
-                if torch.any(patch_mask):
-                    # Get unique patch IDs and process all at once
-                    patch_ids = torch.unique(is_mat_patch[patch_mask])
-                    # Call surrogate integration (returns global K and F)
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # FE integration (regular elements)
+                K_fe = None
+                F_fe = None
+                if has_fe:
+                    K_fe, F_fe = (
+                        self._integrate_fe_subset(
+                            fe_indices, u, defgrad,
+                            stress, state, n, du,
+                            de0, nlgeom))
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Surrogate integration (patch elements)
+                K_surr = None
+                F_surr = None
+                patch_k_dict = {}
+                hidden_state_out = None
+                if has_surr:
+                    patch_ids = torch.unique(
+                        is_mat_patch[patch_mask])
+                    surr_kwargs = dict(
+                        model=None,
+                        u=u, n=n, du=du,
+                        is_stepwise=is_stepwise,
+                        patch_ids=patch_ids,
+                        edge_feature_type=
+                            edge_feature_type,
+                        model_cache=model_cache,
+                        patch_resolution=
+                            patch_resolution)
                     if is_stepwise:
-                        K_raw, F_int, hidden_state_out = \
-                            self.surrogate_integrate_material(
-                            model, u, n, du,
-                            is_stepwise=is_stepwise,
-                            patch_ids=patch_ids,
-                            hidden_states=hidden_states_dict,
-                            edge_feature_type=edge_feature_type)
+                        surr_kwargs[
+                            'hidden_states'] = (
+                            hidden_states_dict)
+                        (K_surr, F_surr,
+                         hidden_state_out,
+                         patch_k_dict) = \
+                            self \
+                            .surrogate_integrate_material(
+                            **surr_kwargs)
                     else:
-                        K_raw, F_int = \
-                            self.surrogate_integrate_material(
-                            model, u, n, du,
-                            is_stepwise=is_stepwise,
-                            patch_ids=patch_ids,
-                            edge_feature_type=edge_feature_type)
-                    # Apply constraint elimination
-                    self.K = \
-                        self._apply_constraints_sparse(
-                            K_raw, con)
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # # OLD: Assemble results for all patches
-                # k[patch_mask] = k_surr[patch_mask]
-                # f_i[patch_mask] = f_surr[patch_mask]
-                # # OLD: Assemble global stiffness matrix and internal force
-                # if self.K.numel() == 0 or not self.material.n_state == 0 or \
-                #     nlgeom:
-                #     self.K = self.assemble_stiffness(k, con)
-                # F_int = self.assemble_force(f_i)
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        (K_surr, F_surr,
+                         patch_k_dict) = \
+                            self \
+                            .surrogate_integrate_material(
+                            **surr_kwargs)
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Combine FE and surrogate contributions
+                if has_fe and has_surr:
+                    K_combined = (
+                        K_fe + K_surr).coalesce()
+                    F_int = F_fe + F_surr
+                elif has_fe:
+                    K_combined = K_fe
+                    F_int = F_fe
+                else:
+                    K_combined = K_surr
+                    F_int = F_surr
+                # Apply constraint elimination
+                self.K = (
+                    self._apply_constraints_sparse(
+                        K_combined, con))
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Compute residual
                 residual = F_int - F_ext
                 residual[con] = 0.0
@@ -1801,17 +1959,32 @@ class FEM(ABC):
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Check convergence
                 if res_norm < rtol * res_norm0 or res_norm < atol:
-                    # Update patch-specific hidden states with converged values
+                    # Update patch-specific hidden states
+                    # with converged values
                     if is_stepwise:
-                        # Update patch-specific hidden states 
-                        # with converged values
-                        # hidden_state_out contains the updated states for 
-                        # processed patches
                         for pid in patch_ids:
-                            patch_key = f"patch_{pid.item()}"
-                            # Update the patch-specific hidden states
-                            hidden_states_dict[patch_key] = hidden_state_out[
-                                patch_key]
+                            patch_key = \
+                                f"patch_{pid.item()}"
+                            hidden_states_dict[
+                                patch_key] = \
+                                hidden_state_out[
+                                    patch_key]
+                    # Save converged per-patch stiffness
+                    if (is_export_stiffness
+                            and stiffness_output_dir):
+                        import os
+                        for pid, k_mat in \
+                                patch_k_dict.items():
+                            fname = (
+                                f'stiffness_'
+                                f'{patch_size_label}'
+                                f'_id{pid}'
+                                f'_inc{n}.npy')
+                            np.save(
+                                os.path.join(
+                                    stiffness_output_dir,
+                                    fname),
+                                k_mat.cpu().numpy())
                     break
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Use cached solve from previous iteration if available
@@ -1847,10 +2020,11 @@ class FEM(ABC):
             if return_volumes:
                 volumes[n] = self.integrate_field()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Disable stepwise mode after computation
+        # Disable stepwise mode on all cached models
         if is_stepwise:
-            model.set_rnn_mode(is_stepwise=False)
-            model._restore_time_series_attrs()
+            for m in model_cache.values():
+                m.set_rnn_mode(is_stepwise=False)
+                m._restore_time_series_attrs()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Aggregate integration points as mean
         if aggregate_integration_points:

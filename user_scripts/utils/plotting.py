@@ -240,4 +240,265 @@ def plot_shape_functions(domain, output_filename):
         output_filename.replace('.pkl', '_shape_functions.png'),
         dpi=300, bbox_inches='tight')
     plt.close()
+# -----------------------------------------------------------------------------
+def _draw_wireframe(ax, nodes_np, elements_np,
+                    color='lightgray', linewidth=0.5):
+    """Draw element wireframe on an axes object.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Target axes.
+    nodes_np : numpy.ndarray(2d)
+        Nodal coordinates of shape (n_nodes, 2).
+    elements_np : numpy.ndarray(2d)
+        Element connectivity of shape (n_elem, 4).
+    color : str, default='lightgray'
+        Line color.
+    linewidth : float, default=0.5
+        Line width.
+    """
+
+    for elem in elements_np:
+        x = nodes_np[elem[[0, 1, 2, 3, 0]], 0]
+        y = nodes_np[elem[[0, 1, 2, 3, 0]], 1]
+        ax.plot(x, y, color=color, linewidth=linewidth)
+# -----------------------------------------------------------------------------
+def plot_boundary_overlay(
+        nodes, elements, u_surrogate,
+        patch_boundary_nodes_dict, output_path):
+    """Overlay of reference and deformed boundary nodes.
+
+    Renders element wireframe in the background, open circles
+    at reference positions, filled circles at deformed
+    positions colored by displacement magnitude, and arrows
+    from reference to deformed configuration.
+
+    Parameters
+    ----------
+    nodes : torch.Tensor
+        Reference coordinates of shape (n_nodes, 2).
+    elements : torch.Tensor
+        Element connectivity of shape (n_elem, 4).
+    u_surrogate : torch.Tensor
+        Surrogate displacement of shape (n_nodes, 2).
+    patch_boundary_nodes_dict : dict
+        Mapping patch_id (int) to boundary node indices
+        (torch.Tensor of dtype long).
+    output_path : str
+        File path where the figure is saved.
+    """
+
+    nodes_np = nodes.detach().cpu().numpy()
+    elements_np = elements.detach().cpu().numpy()
+    u_np = u_surrogate.detach().cpu().numpy()
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Collect all boundary node indices (unique)
+    bd_set = set()
+    for idx_tensor in patch_boundary_nodes_dict.values():
+        bd_set.update(idx_tensor.tolist())
+    bd_idx = np.array(sorted(bd_set))
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Boundary node coordinates and displacements
+    ref_xy = nodes_np[bd_idx]
+    u_bd = u_np[bd_idx]
+    def_xy = ref_xy + u_bd
+    u_mag = np.sqrt(u_bd[:, 0]**2 + u_bd[:, 1]**2)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    fig, ax = plt.subplots(figsize=(8, 8))
+    # Wireframe
+    _draw_wireframe(ax, nodes_np, elements_np)
+    # Reference positions (open circles)
+    ax.scatter(
+        ref_xy[:, 0], ref_xy[:, 1],
+        s=30, facecolors='none', edgecolors='gray',
+        linewidths=0.8, zorder=3,
+        label='Reference')
+    # Deformed positions (filled, colored by |u|)
+    sc = ax.scatter(
+        def_xy[:, 0], def_xy[:, 1],
+        s=30, c=u_mag, cmap='viridis',
+        edgecolors='black', linewidths=0.4,
+        zorder=4, label='Deformed')
+    # Arrows reference -> deformed
+    ax.quiver(
+        ref_xy[:, 0], ref_xy[:, 1],
+        u_bd[:, 0], u_bd[:, 1],
+        angles='xy', scale_units='xy', scale=1,
+        color='tab:red', alpha=0.6, width=0.003,
+        zorder=2)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    plt.colorbar(
+        sc, ax=ax,
+        label=r'$||\tilde{\mathbf{u}}||$')
+    ax.set_aspect('equal')
+    ax.legend(loc='upper left', fontsize=8)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+# -----------------------------------------------------------------------------
+def plot_boundary_panels(
+        nodes, elements, u_surrogate,
+        patch_boundary_nodes_dict, output_path,
+        u_reference=None):
+    """Side-by-side panels of boundary node displacements.
+
+    Left: boundary nodes at reference positions colored by
+    surrogate |u|. Center: boundary nodes at deformed
+    positions colored by surrogate |u|. Right (if u_reference
+    is provided): boundary nodes colored by
+    |u_surrogate - u_reference|.
+
+    Parameters
+    ----------
+    nodes : torch.Tensor
+        Reference coordinates of shape (n_nodes, 2).
+    elements : torch.Tensor
+        Element connectivity of shape (n_elem, 4).
+    u_surrogate : torch.Tensor
+        Surrogate displacement of shape (n_nodes, 2).
+    patch_boundary_nodes_dict : dict
+        Mapping patch_id (int) to boundary node indices
+        (torch.Tensor of dtype long).
+    output_path : str
+        File path where the figure is saved.
+    u_reference : {torch.Tensor, None}, default=None
+        Reference displacement of shape (n_nodes, 2).
+        When provided, the error panel is included.
+    """
+
+    nodes_np = nodes.detach().cpu().numpy()
+    elements_np = elements.detach().cpu().numpy()
+    u_srg_np = u_surrogate.detach().cpu().numpy()
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Collect all boundary node indices (unique)
+    bd_set = set()
+    for idx_tensor in patch_boundary_nodes_dict.values():
+        bd_set.update(idx_tensor.tolist())
+    bd_idx = np.array(sorted(bd_set))
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ref_xy = nodes_np[bd_idx]
+    u_bd = u_srg_np[bd_idx]
+    def_xy = ref_xy + u_bd
+    u_mag = np.sqrt(u_bd[:, 0]**2 + u_bd[:, 1]**2)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    n_panels = 3 if u_reference is not None else 2
+    fig, axes = plt.subplots(
+        1, n_panels, figsize=(6 * n_panels, 6))
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Panel 1: reference positions, colored by |u_srg|
+    _draw_wireframe(axes[0], nodes_np, elements_np)
+    sc0 = axes[0].scatter(
+        ref_xy[:, 0], ref_xy[:, 1],
+        s=30, c=u_mag, cmap='viridis',
+        edgecolors='black', linewidths=0.4,
+        vmin=u_mag.min(), vmax=u_mag.max(),
+        zorder=4)
+    axes[0].set_aspect('equal')
+    axes[0].set_title(
+        r'Reference config — $||\mathbf{u}_{srg}||$')
+    plt.colorbar(sc0, ax=axes[0])
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Panel 2: deformed positions, colored by |u_srg|
+    _draw_wireframe(axes[1], nodes_np, elements_np)
+    sc1 = axes[1].scatter(
+        def_xy[:, 0], def_xy[:, 1],
+        s=30, c=u_mag, cmap='viridis',
+        edgecolors='black', linewidths=0.4,
+        vmin=u_mag.min(), vmax=u_mag.max(),
+        zorder=4)
+    axes[1].set_aspect('equal')
+    axes[1].set_title(
+        r'Deformed config — $||\mathbf{u}_{srg}||$')
+    plt.colorbar(sc1, ax=axes[1])
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Panel 3: error (only if reference available)
+    if u_reference is not None:
+        u_ref_np = u_reference.detach().cpu().numpy()
+        u_err = u_srg_np[bd_idx] - u_ref_np[bd_idx]
+        err_mag = np.sqrt(
+            u_err[:, 0]**2 + u_err[:, 1]**2)
+        _draw_wireframe(
+            axes[2], nodes_np, elements_np)
+        sc2 = axes[2].scatter(
+            ref_xy[:, 0], ref_xy[:, 1],
+            s=30, c=err_mag, cmap='Reds',
+            edgecolors='black', linewidths=0.4,
+            zorder=4)
+        axes[2].set_aspect('equal')
+        axes[2].set_title(
+            r'$||\mathbf{u}_{srg}'
+            r' - \mathbf{u}_{ref}||$')
+        plt.colorbar(sc2, ax=axes[2])
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+# -----------------------------------------------------------------------------
+def plot_boundary_error_overlay(
+        nodes, elements, u_surrogate, u_reference,
+        patch_boundary_nodes_dict, output_path):
+    """Overlay of displacement error arrows at boundary nodes.
+
+    Renders element wireframe in the background, boundary
+    nodes colored by error magnitude, and arrows showing the
+    displacement error vector (u_surrogate - u_reference).
+
+    Parameters
+    ----------
+    nodes : torch.Tensor
+        Reference coordinates of shape (n_nodes, 2).
+    elements : torch.Tensor
+        Element connectivity of shape (n_elem, 4).
+    u_surrogate : torch.Tensor
+        Surrogate displacement of shape (n_nodes, 2).
+    u_reference : torch.Tensor
+        Reference displacement of shape (n_nodes, 2).
+    patch_boundary_nodes_dict : dict
+        Mapping patch_id (int) to boundary node indices
+        (torch.Tensor of dtype long).
+    output_path : str
+        File path where the figure is saved.
+    """
+
+    nodes_np = nodes.detach().cpu().numpy()
+    elements_np = elements.detach().cpu().numpy()
+    u_srg_np = u_surrogate.detach().cpu().numpy()
+    u_ref_np = u_reference.detach().cpu().numpy()
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Collect all boundary node indices (unique)
+    bd_set = set()
+    for idx_tensor in patch_boundary_nodes_dict.values():
+        bd_set.update(idx_tensor.tolist())
+    bd_idx = np.array(sorted(bd_set))
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ref_xy = nodes_np[bd_idx]
+    u_err = u_srg_np[bd_idx] - u_ref_np[bd_idx]
+    err_mag = np.sqrt(
+        u_err[:, 0]**2 + u_err[:, 1]**2)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    fig, ax = plt.subplots(figsize=(8, 8))
+    _draw_wireframe(ax, nodes_np, elements_np)
+    # Boundary nodes colored by error magnitude
+    sc = ax.scatter(
+        ref_xy[:, 0], ref_xy[:, 1],
+        s=30, c=err_mag, cmap='Reds',
+        edgecolors='black', linewidths=0.4,
+        zorder=4)
+    # Error arrows
+    ax.quiver(
+        ref_xy[:, 0], ref_xy[:, 1],
+        u_err[:, 0], u_err[:, 1],
+        angles='xy', scale_units='xy', scale=1,
+        color='tab:blue', alpha=0.6, width=0.003,
+        zorder=3)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    plt.colorbar(
+        sc, ax=ax,
+        label=(r'$||\tilde{\mathbf{u}}'
+               r' - \mathbf{u}_{ref}||$'))
+    ax.set_aspect('equal')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
 # =============================================================================
