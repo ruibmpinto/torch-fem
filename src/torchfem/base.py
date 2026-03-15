@@ -1375,11 +1375,14 @@ class FEM(ABC):
         self._edges_indexes[f"patch_{patch_id}"] = edges_indexes
     # -------------------------------------------------------------------------
     def surrogate_integrate_material(
-        self, model, u: Tensor, n: int, du: Tensor,
+        self, model, u: Tensor, n: int,
+        du: Tensor,
         is_stepwise: bool = False,
         patch_ids: Tensor = None,
         hidden_states: dict = None,
         edge_feature_type: tuple = ('edge_vector',),
+        model_cache: dict = None,
+        patch_resolution: dict = None,
     ) -> Tuple[Tensor, Tensor]:
         """Perform surrogate integration using Graphorge material patch model.
 
@@ -1443,6 +1446,13 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Loop over patches
         for idx_patch in patch_indices:
+            # Select model for this patch
+            if (model_cache is not None
+                    and patch_resolution is not None):
+                res = patch_resolution[idx_patch]
+                model = model_cache[res]
+            elif model_cache is not None:
+                model = model_cache['default']
             # Get patch identifier for stepwise mode
             patch_id = f"patch_{idx_patch}"
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1648,10 +1658,11 @@ class FEM(ABC):
         nlgeom: bool = False,
         return_volumes: bool = False,
         is_stepwise: bool = False,
-        model_directory: str | None = None,
+        model_directory: str | dict | None = None,
         return_resnorm: bool = False,
         patch_boundary_nodes: dict | None = None,
-        patch_elem_per_dim: list | None = None,
+        patch_elem_per_dim: list | dict | None = None,
+        patch_resolution: dict | None = None,
         edge_type: str = 'all',
         edge_feature_type: tuple = ('edge_vector',),
         is_export_stiffness: bool = False,
@@ -1761,80 +1772,98 @@ class FEM(ABC):
         fe_indices = None
         if has_fe:
             fe_indices = torch.where(fe_mask)[0]
-        model = None
+        model_cache = {}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Load surrogate model
+        # Load surrogate model(s)
         if torch.any(patch_mask):
-            # Use provided model directory or default path
-            if model_directory is None:
-                model_directory = (
-                    "/Users/rbarreira/Desktop/machine_learning/material_patches/"
-                    "graphorge_material_patches/src/graphorge/projects/"
-                    "material_patches/elastic/2d/quad4/mesh1x1/ninc1/"
-                    "26.1_force_equilibrium_npath10000/reference/3_model")
-            model = self._load_Graphorge_model(
-                model_directory=model_directory,
-                device_type=device if device else 'cpu')
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Enable stepwise mode
-            # Temporarily set attributes for single-step mode (_n_time_* = 1)
+            dev = device if device else 'cpu'
+            if isinstance(model_directory, dict):
+                # Multi-resolution: dict keyed by
+                # resolution tuple -> model path
+                for res_key, path in (
+                        model_directory.items()):
+                    model_cache[res_key] = (
+                        self._load_Graphorge_model(
+                            model_directory=path,
+                            device_type=dev))
+            # else:
+            #     # Single model (backward compat)
+            #     if model_directory is None:
+            #         model_directory = (
+            #             '/Users/rbarreira/Desktop/'
+            #             'machine_learning/'
+            #             'material_patches/'
+            #             'graphorge_material_patches/'
+            #             'src/graphorge/projects/'
+            #             'material_patches/elastic/'
+            #             '2d/quad4/mesh1x1/ninc1/'
+            #             '26.1_force_equilibrium_'
+            #             'npath10000/reference/'
+            #             '3_model')
+            #     model_cache['default'] = (
+            #         self._load_Graphorge_model(
+            #             model_directory=model_directory,
+            #             device_type=dev))
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Enable stepwise mode on all cached models
             if is_stepwise:
-                # Store original attributes for stepwise data scaler access
-                # orig_attrs = 
-                model._save_time_series_attrs()
-                # model._original_time_attrs = orig_attrs
-                # Enable stepwise mode
-                model.set_rnn_mode(is_stepwise=True)
-            
-            # Initialize patch_id dictionary with None values
-            patch_ids = torch.unique(is_mat_patch[is_mat_patch >= 0])
-            # Initialize edges_indexes dict and patch boundary nodes dict
+                for m in model_cache.values():
+                    m._save_time_series_attrs()
+                    m.set_rnn_mode(is_stepwise=True)
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Initialize patch IDs and topology
+            patch_ids = torch.unique(
+                is_mat_patch[is_mat_patch >= 0])
             self._edges_indexes = {}
             self.patch_bd_nodes = {}
-            # Populate patch boundary nodes from input parameter
             if patch_boundary_nodes is not None:
-                self.patch_bd_nodes = patch_boundary_nodes
-            # Initialize hidden states dict before loop to accumulate all patches
+                self.patch_bd_nodes = (
+                    patch_boundary_nodes)
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Build graph topology and hidden states
+            # per patch (resolution-aware)
             hidden_states_dict = {}
             for pid in patch_ids:
                 pid_int = pid.item()
-                # Build graph topology for this material patch
+                # Resolve per-patch elem_per_dim
+                if isinstance(
+                        patch_elem_per_dim, dict):
+                    epd = patch_elem_per_dim[pid_int]
+                else:
+                    epd = patch_elem_per_dim
                 self._build_graph_topology(
-                    pid_int, patch_elem_per_dim,
+                    pid_int, epd,
                     edge_type=edge_type)
-                # Initialize hidden states structure for GNN model
-                # Same structure as graphorge:
-                # - encoder: for encoding layers
-                # - processor: for message passing layers (layer_0, layer_1, etc.)
-                # - decoder: for decoding layers
-                # Each layer can have node, edge, global hidden states
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Get number of message passing steps from model if available
-                n_message_steps = model._n_message_steps
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Create processor hidden states for each layer
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Select model for this patch's
+                # resolution to get n_message_steps
+                if patch_resolution is not None:
+                    res = patch_resolution[pid_int]
+                    m = model_cache[res]
+                else:
+                    m = model_cache['default']
+                n_msg = m._n_message_steps
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Create processor hidden states
                 processor_hidden = {}
-                for layer_idx in range(n_message_steps):
-                    processor_hidden[f'layer_{layer_idx}'] = {
+                for li in range(n_msg):
+                    processor_hidden[
+                        f'layer_{li}'] = {
                         'node': None,
                         'edge': None,
-                        'global': None
-                    }
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Accumulate hidden states for each patch
-                hidden_states_dict[f"patch_{pid_int}"] = {
+                        'global': None}
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                hidden_states_dict[
+                    f'patch_{pid_int}'] = {
                     'encoder': {
                         'node': None,
                         'edge': None,
-                        'global': None
-                    },
+                        'global': None},
                     'processor': processor_hidden,
                     'decoder': {
                         'node': None,
                         'edge': None,
-                        'global': None
-                    }
-                }
+                        'global': None}}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Incremental loading
         for n in range(1, N):
@@ -1869,29 +1898,32 @@ class FEM(ABC):
                 if has_surr:
                     patch_ids = torch.unique(
                         is_mat_patch[patch_mask])
+                    surr_kwargs = dict(
+                        model=None,
+                        u=u, n=n, du=du,
+                        is_stepwise=is_stepwise,
+                        patch_ids=patch_ids,
+                        edge_feature_type=
+                            edge_feature_type,
+                        model_cache=model_cache,
+                        patch_resolution=
+                            patch_resolution)
                     if is_stepwise:
+                        surr_kwargs[
+                            'hidden_states'] = (
+                            hidden_states_dict)
                         (K_surr, F_surr,
                          hidden_state_out,
                          patch_k_dict) = \
                             self \
                             .surrogate_integrate_material(
-                            model, u, n, du,
-                            is_stepwise=is_stepwise,
-                            patch_ids=patch_ids,
-                            hidden_states=
-                                hidden_states_dict,
-                            edge_feature_type=
-                                edge_feature_type)
+                            **surr_kwargs)
                     else:
                         (K_surr, F_surr,
                          patch_k_dict) = \
                             self \
                             .surrogate_integrate_material(
-                            model, u, n, du,
-                            is_stepwise=is_stepwise,
-                            patch_ids=patch_ids,
-                            edge_feature_type=
-                                edge_feature_type)
+                            **surr_kwargs)
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Combine FE and surrogate contributions
                 if has_fe and has_surr:
@@ -1988,10 +2020,11 @@ class FEM(ABC):
             if return_volumes:
                 volumes[n] = self.integrate_field()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Disable stepwise mode after computation
+        # Disable stepwise mode on all cached models
         if is_stepwise:
-            model.set_rnn_mode(is_stepwise=False)
-            model._restore_time_series_attrs()
+            for m in model_cache.values():
+                m.set_rnn_mode(is_stepwise=False)
+                m._restore_time_series_attrs()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Aggregate integration points as mean
         if aggregate_integration_points:

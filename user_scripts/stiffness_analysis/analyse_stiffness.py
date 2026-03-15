@@ -908,7 +908,7 @@ def plot_cross_resolution_invariants(
 # =============================================================================
 if __name__ == '__main__':
     # Flags
-    include_cholesky = False
+    include_cholesky = True
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Paths
     torch_fem_root = str(

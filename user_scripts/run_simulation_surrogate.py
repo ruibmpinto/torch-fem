@@ -70,16 +70,26 @@ __status__ = 'Development'
 torch.set_default_dtype(torch.float64)
 # -----------------------------------------------------------------------------
 def run_simulation_surrogate(
-    element_type='quad4',
-    material_behavior='elastic',
-    mesh_nx=1, mesh_ny=1, mesh_nz=1,
-    patch_size_x=1, patch_size_y=1,
-    patch_size_z=1,
-    model_path=None, edge_type='all',
-    edge_feature_type=('edge_vector',),
-    fe_border=0):
-    """
-    Run simulation using solve_matpatch function with Graphorge surrogate model
+        element_type='quad4',
+        material_behavior='elastic',
+        mesh_nx=1, mesh_ny=1, mesh_nz=1,
+        patch_size_x=1, patch_size_y=1,
+        patch_size_z=1,
+        model_path=None, edge_type='all',
+        edge_feature_type=('edge_vector',),
+        fe_border=0, patch_zones=None):
+    """Run simulation with Graphorge surrogate model.
+
+    Parameters
+    ----------
+    patch_zones : list[dict], default=None
+        List of zone dicts, each with keys:
+        - 'region': (row_start, row_end,
+                     col_start, col_end)
+        - 'patch_size': (nx, ny)
+        When None, a single zone is built from
+        patch_size_x/y covering the full surrogate
+        region (backward compatible).
     """
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Monitor memory and time
@@ -121,16 +131,9 @@ def run_simulation_surrogate(
     torch_fem_root = os.path.dirname(script_dir)
     results_base = os.path.join(torch_fem_root, 'results')
     surrogates_dir = os.path.join(script_dir, 'matpatch_surrogates')
-    if model_path is None:
-        patch_str = f'{patch_size_x}x{patch_size_y}'
-        if dim == 3:
-            patch_str = f'{patch_size_x}x{patch_size_y}x{patch_size_z}'
-        if material_behavior == 'elastoplastic':
-            model_path = os.path.join(
-                surrogates_dir, 'elastoplastic_nlh', patch_str, 'model')
-        elif material_behavior == 'elastic':
-            model_path = os.path.join(
-                surrogates_dir, 'elastic', patch_str, 'model')
+    # Build model path(s) -- single or multi-resolution
+    # (deferred until after patch_zones are resolved)
+    # model_path / model_directory_map set below
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Constitutive law
     if material_behavior == 'elastic':
@@ -215,36 +218,89 @@ def run_simulation_surrogate(
     # Define material patch flag - map elements to patches
     num_elements = elements.shape[0]
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Meshing with material patches
-    # Calculate number of patches based on patch size
-    # fe_border: number of element layers at domain
-    # boundary that use standard FE integration.
-    # Elements inside the border use surrogates.
-    surr_nx = mesh_nx - 2 * fe_border
-    surr_ny = mesh_ny - 2 * fe_border
-    num_patches_x = surr_nx // patch_size_x
-    num_patches_y = surr_ny // patch_size_y
-    # Map each element to its patch ID or -1 (FE)
+    # Build patch_zones if not provided (backward compat)
+    if patch_zones is None:
+        surr_nx = mesh_nx - 2 * fe_border
+        surr_ny = mesh_ny - 2 * fe_border
+        patch_zones = [{
+            'region': (
+                fe_border, fe_border + surr_ny,
+                fe_border, fe_border + surr_nx),
+            'patch_size': (
+                patch_size_x, patch_size_y),
+        }]
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Classify elements into patches (multi-zone)
+    patch_id_counter = 0
+    patch_resolution = {}
     is_mat_patch = torch.full(
         (num_elements,), -1, dtype=torch.int)
-    for elem_idx in range(num_elements):
-        elem_i = elem_idx // mesh_nx
-        elem_j = elem_idx % mesh_nx
-        # Check if element is in surrogate region
-        if (fe_border <= elem_i
-                < mesh_ny - fe_border
-                and fe_border <= elem_j
-                < mesh_nx - fe_border):
-            patch_i = (
-                (elem_i - fe_border)
-                // patch_size_y)
-            patch_j = (
-                (elem_j - fe_border)
-                // patch_size_x)
-            patch_id = (
-                patch_i * num_patches_x
-                + patch_j)
-            is_mat_patch[elem_idx] = patch_id
+    for zone in patch_zones:
+        r0, r1, c0, c1 = zone['region']
+        psx, psy = zone['patch_size']
+        zone_nx = (c1 - c0) // psx
+        zone_ny = (r1 - r0) // psy
+        for elem_idx in range(num_elements):
+            ei = elem_idx // mesh_nx
+            ej = elem_idx % mesh_nx
+            if (r0 <= ei < r1
+                    and c0 <= ej < c1):
+                pi = (ei - r0) // psy
+                pj = (ej - c0) // psx
+                pid = (patch_id_counter
+                       + pi * zone_nx + pj)
+                is_mat_patch[elem_idx] = pid
+                patch_resolution[pid] = (
+                    psx, psy)
+        patch_id_counter += zone_nx * zone_ny
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Build model directory map from unique resolutions
+    unique_res = set(patch_resolution.values())
+    is_multi_res = len(unique_res) > 1
+    if model_path is not None:
+        # Explicit single model path overrides
+        model_directory_map = model_path
+        patch_resolution_arg = None
+    elif is_multi_res:
+        model_directory_map = {}
+        for res in unique_res:
+            ps = f'{res[0]}x{res[1]}'
+            if material_behavior == 'elastoplastic':
+                model_directory_map[res] = (
+                    os.path.join(
+                        surrogates_dir,
+                        'elastoplastic_nlh',
+                        ps, 'model'))
+            else:
+                model_directory_map[res] = (
+                    os.path.join(
+                        surrogates_dir,
+                        material_behavior,
+                        ps, 'model'))
+        patch_resolution_arg = patch_resolution
+    else:
+        # Single resolution -- pass str for compat
+        res = list(unique_res)[0]
+        ps = f'{res[0]}x{res[1]}'
+        if material_behavior == 'elastoplastic':
+            model_directory_map = os.path.join(
+                surrogates_dir,
+                'elastoplastic_nlh', ps, 'model')
+        else:
+            model_directory_map = os.path.join(
+                surrogates_dir,
+                material_behavior, ps, 'model')
+        patch_resolution_arg = None
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Build patch_elem_per_dim map
+    if is_multi_res:
+        patch_elem_per_dim_map = {
+            pid: list(res)
+            for pid, res
+            in patch_resolution.items()}
+    else:
+        res = list(unique_res)[0]
+        patch_elem_per_dim_map = list(res)
 
     # Identify boundary nodes of material patches
     # Build node-to-patches mapping (only patch elems)
@@ -326,7 +382,7 @@ def run_simulation_surrogate(
     # Build patch_boundary_nodes_dict:
     # patch_id -> boundary node indices
     patch_boundary_nodes_dict = {}
-    n_patches = num_patches_x * num_patches_y
+    n_patches = patch_id_counter
     for patch_id in range(n_patches):
         patch_boundary_set = set()
         for node_id, patches in (
@@ -510,19 +566,18 @@ def run_simulation_surrogate(
     # Profile solve_matpatch method
     profiler_matpatch = cProfile.Profile()
     profiler_matpatch.enable()
-    # Build patch_elem_per_dim list
-    if dim == 2:
-        patch_elem_per_dim = [patch_size_x, patch_size_y]
-    elif dim == 3:
-        patch_elem_per_dim = [
-            patch_size_x, patch_size_y, patch_size_z]
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Build output directory paths for stiffness saving
     mesh_str = f'{mesh_nx}x{mesh_ny}'
-    patch_str = f'{patch_size_x}x{patch_size_y}'
+    if is_multi_res:
+        patch_str = '_'.join(
+            f'{r[0]}x{r[1]}'
+            for r in sorted(unique_res))
+    else:
+        res0 = list(unique_res)[0]
+        patch_str = f'{res0[0]}x{res0[1]}'
     if dim == 3:
         mesh_str += f'x{mesh_nz}'
-        patch_str += f'x{patch_size_z}'
     n_increments = len(increments) - 1
     output_dir = os.path.join(
         results_base, material_behavior, f'{dim}d',
@@ -530,7 +585,6 @@ def run_simulation_surrogate(
         f'patch_{patch_str}',
         f'n_time_inc_{n_increments}')
     os.makedirs(output_dir, exist_ok=True)
-    # Create stiffness output directory
     stiffness_dir = os.path.join(
         output_dir, 'stiffness')
     os.makedirs(stiffness_dir, exist_ok=True)
@@ -546,9 +600,13 @@ def run_simulation_surrogate(
         return_volumes=False,
         return_resnorm=True,
         is_stepwise=is_stepwise,
-        model_directory=model_path,
-        patch_boundary_nodes=patch_boundary_nodes_dict,
-        patch_elem_per_dim=patch_elem_per_dim,
+        model_directory=model_directory_map,
+        patch_boundary_nodes=
+            patch_boundary_nodes_dict,
+        patch_elem_per_dim=
+            patch_elem_per_dim_map,
+        patch_resolution=
+            patch_resolution_arg,
         edge_type=edge_type,
         edge_feature_type=edge_feature_type,
         is_export_stiffness=True,
@@ -740,16 +798,34 @@ def run_simulation_surrogate(
             'boundary_error_overlay.png'))
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
-    # Hybrid mesh: 1-element FE border + surrogates
+    # Multi-resolution: 8x8 mesh, no FE border
+    # Top-left 4x4 block  -> one 4x4 patch
+    # Top-right 4x4 block -> four 2x2 patches
+    # Bot-left 4x4 block  -> four 2x2 patches
+    # Bot-right 4x4 block -> one 4x4 patch
     run_simulation_surrogate(
         element_type='quad4',
         material_behavior='elastic',
-        mesh_nx=12,
-        mesh_ny=12,
-        mesh_nz=1,
-        patch_size_x=2,
-        patch_size_y=2,
+        mesh_nx=20,
+        mesh_ny=20,
         edge_type='all',
         edge_feature_type=(
-            'edge_vector', 'rel_disp'),
-        fe_border=1)
+            'edge_vector'),
+        # fe_border=0,
+        patch_size_x=5,
+        patch_size_y=5
+        # patch_zones=[
+        #     # Top-left 4x4: rows 0-3, cols 0-3
+        #     {'region': (0, 4, 0, 4),
+        #      'patch_size': (4, 4)},
+        #     # Top-right 4x4: rows 0-3, cols 4-7
+        #     {'region': (0, 4, 4, 8),
+        #      'patch_size': (2, 2)},
+        #     # Bot-left 4x4: rows 4-7, cols 0-3
+        #     {'region': (4, 8, 0, 4),
+        #      'patch_size': (2, 2)},
+        #     # Bot-right 4x4: rows 4-7, cols 4-7
+        #     {'region': (4, 8, 4, 8),
+        #      'patch_size': (4, 4)},
+        # ]
+        )

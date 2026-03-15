@@ -5,7 +5,7 @@ Summary: Model training
 
 "seed":  None
 
-"model_directory":  /cluster/scratch/rbarreira/material_patches/src/graphorge/projects/material_patches/optimization/cluster_setup/hyperparameter_opt/grid_search/elastic/quad4/8x8/ntime1/epd_coordhist_disphist_edgevec_reldisp_all_5000/trial_2338/model
+"model_directory":  /Users/rbarreira/Desktop/machine_learning/material_patches/graphorge_material_patches/src/graphorge/projects/material_patches/elastic/2d/quad4/mesh8x8/ninc1/rbm_delete/3_model
 
 "load_model_state":  None
 
@@ -15,7 +15,7 @@ Summary: Model training
 
 "is_model_out_normalized":  True
 
-"batch_size":  16
+"batch_size":  8
 
 "is_sampler_shuffle":  False
 
@@ -32,16 +32,16 @@ Summary: Model training
 "lr_scheduler_type":  explr
 
 "lr_scheduler_kwargs":
-  "gamma": 0.9954054173
+  "gamma": 0.995405417351527
 
 "Number of completed epochs":  1000
 
-"Training data set file":  None
+"Training data set file":  /Users/rbarreira/Desktop/machine_learning/material_patches/graphorge_material_patches/src/graphorge/projects/material_patches/elastic/2d/quad4/mesh8x8/ninc1/rbm_delete/1_training_dataset/matpatch_graph_dataset_n4000.pkl
 
 "Training data set size":  4000
 
-"Best loss: ":  2.09039309e-07 (training epoch 999)
+"Best loss: ":  2.65133572e-07 (training epoch 999)
 
-"Total training time":  1 day, 5:11:09
+"Total training time":  7:20:43
 
-"Avg. training time per epoch":  0:01:45
+"Avg. training time per epoch":  0:00:26
