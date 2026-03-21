@@ -256,10 +256,10 @@ def compute_surrogate_stiffness(
     def forward(disp_boundary):
         """Forward closure for jacfwd."""
 
-        disp_mean = disp_boundary.mean(
-            dim=0, keepdim=True)
-        disp_centered = disp_boundary - disp_mean
-        disp_scaled = disp_centered / L
+        # disp_mean = disp_boundary.mean(
+        #     dim=0, keepdim=True)
+        # disp_centered = disp_boundary - disp_mean
+        disp_scaled = disp_boundary / L
         pred_scaled = forward_graph(
             model=model,
             disps=disp_scaled,
@@ -270,10 +270,20 @@ def compute_surrogate_stiffness(
         pred_real = pred_scaled * L
         return pred_real, pred_real.detach()
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Compute Jacobian = stiffness matrix
-    jacobian, _ = torch_func.jacfwd(
-        forward, has_aux=True)(disp_zero)
-    K = jacobian.view(n_dof, n_dof)
+    # Compute Jacobian column-by-column via jvp
+    # (constant memory, avoids jacfwd OOM on large meshes)
+    cols = []
+    for i in range(n_dof):
+        tangent = torch.zeros(
+            n_dof, dtype=disp_zero.dtype)
+        tangent[i] = 1.0
+        tangent = tangent.view(n_bd, n_dim)
+        _, jvp_col = torch_func.jvp(
+            lambda u: forward(u)[0],
+            (disp_zero,),
+            (tangent,))
+        cols.append(jvp_col.flatten().detach())
+    K = torch.stack(cols, dim=1)
     return K, coords
 
 

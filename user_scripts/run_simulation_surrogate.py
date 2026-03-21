@@ -338,7 +338,7 @@ def run_simulation_surrogate(
         else:
             model_directory_map = os.path.join(
                 surrogates_dir,
-                material_behavior, ps, 'model')
+                material_behavior, ps, 'model_rbmdelete')
         patch_resolution_arg = None
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Build patch_elem_per_dim map
@@ -854,15 +854,15 @@ if __name__ == '__main__':
     # Bot-right 4x4 block -> one 4x4 patch
     run_simulation_surrogate(
         element_type='quad4',
-        material_behavior='elastoplastic_nlh',
-        mesh_nx=4,
-        mesh_ny=4,
+        material_behavior='elastic',
+        mesh_nx=32,
+        mesh_ny=32,
         edge_type='all',
         edge_feature_type=(
             'edge_vector', 'relative_disp'),
         # fe_border=0,
-        patch_size_x=1,
-        patch_size_y=1
+        patch_size_x=8,
+        patch_size_y=8
         # patch_zones=[
         #     # Top-left 4x4: rows 0-3, cols 0-3
         #     {'region': (0, 4, 0, 4),

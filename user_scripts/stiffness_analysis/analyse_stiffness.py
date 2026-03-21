@@ -633,8 +633,7 @@ def plot_eigenvalue_spectra_individual(
     """Individual patch eigenvalue spectra (no averaging).
 
     Each patch_id is a distinct colour; increments of the
-    same patch share the colour. Rigid body eigenvalues
-    (first 3) are clearly visible per patch.
+    same patch share the colour.
 
     Parameters
     ----------
