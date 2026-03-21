@@ -35,7 +35,8 @@ if is_import_graphorge:
                 extract_forces,
                 extract_displacements,
                 compute_edge_features,
-                reconstruct_graph_with_displacements)
+                reconstruct_graph_with_displacements,
+                remove_rigid_body_motion)
     import torch.func as torch_func
 
 
@@ -1383,6 +1384,7 @@ class FEM(ABC):
         edge_feature_type: tuple = ('edge_vector',),
         model_cache: dict = None,
         patch_resolution: dict = None,
+        is_jacfwd_parallel: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Perform surrogate integration using Graphorge material patch model.
 
@@ -1399,6 +1401,10 @@ class FEM(ABC):
                 hidden state tracking between steps. Defaults to False.
             patch_ids (Tensor): Patch IDs to process.
             hidden_states (dict): Hidden states for RNN mode.
+            is_jacfwd_parallel (bool): If True, use jacfwd (all tangent
+                vectors simultaneously, high memory). If False, build
+                Jacobian column-by-column via jvp (constant memory,
+                slower). Defaults to True.
 
         Returns:
             Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, dict]: A tuple
@@ -1427,8 +1433,8 @@ class FEM(ABC):
         F_global = torch.zeros(n_dof_global)
 
         # Sparse stiffness assembly (COO format)
-        k_indices = []
-        k_values = []
+        k_indices_list = []
+        k_values_list = []
         # Per-patch boundary stiffness matrices
         patch_stiffness_dict = {}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1541,12 +1547,12 @@ class FEM(ABC):
                 space via _apply_constraints_sparse.
                 """
                 nonlocal hidden_states_trial
-                # Center displacements to remove rigid body
-                # translation before scaling by patch size
-                disp_mean = disp_boundary.mean(
-                    dim=0, keepdim=True)
-                disp_centered = disp_boundary - disp_mean
-                disp_scaled = disp_centered / L
+                # # Center displacements to remove rigid body
+                # # translation before scaling by patch size
+                # disp_mean = disp_boundary.mean(
+                #     dim=0, keepdim=True)
+                # disp_centered = disp_boundary - disp_mean
+                disp_scaled = disp_boundary / L
                 if is_stepwise:
                     pred_scaled, hidden_states_out = forward_graph(
                         model=model,
@@ -1569,12 +1575,32 @@ class FEM(ABC):
                 return pred_real, pred_real.detach()
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute Jacobian: d(forces_boundary)/d(u_boundary)
-            (jacobian, boundary_forces) = torch_func.jacfwd(
-                forward, has_aux=True)(boundary_u_current)
-            # Stiffness shape: (n_boundary*dim, n_boundary*dim)
-            k_boundary = jacobian.view(
-                n_dof_boundary, n_dof_boundary)
-            f_boundary = boundary_forces.flatten()
+            if is_jacfwd_parallel:
+                # Parallel: all tangent vectors at once (high memory)
+                (jacobian, boundary_forces) = torch_func.jacfwd(
+                    forward, has_aux=True)(boundary_u_current)
+                k_boundary = jacobian.view(
+                    n_dof_boundary, n_dof_boundary)
+                f_boundary = boundary_forces.flatten()
+            else:
+                # Sequential: one jvp per DOF (constant memory)
+                boundary_forces, _ = forward(boundary_u_current)
+                f_boundary = boundary_forces.flatten().detach()
+                cols = []
+                for i in range(n_dof_boundary):
+                    tangent = torch.zeros(
+                        n_dof_boundary,
+                        dtype=boundary_u_current.dtype)
+                    tangent[i] = 1.0
+                    tangent = tangent.view(
+                        n_boundary, self.n_dim)
+                    _, jvp_col = torch_func.jvp(
+                        lambda u: forward(u)[0],
+                        (boundary_u_current,),
+                        (tangent,))
+                    cols.append(
+                        jvp_col.flatten().detach())
+                k_boundary = torch.stack(cols, dim=1)
             # Store per-patch boundary stiffness
             patch_stiffness_dict[idx_patch] = \
                 k_boundary.detach().clone()
@@ -1588,28 +1614,23 @@ class FEM(ABC):
             # stiffness_matrix = jacobian.view(n_dof_elem, n_dof_elem)
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Assemble boundary forces to global force vector
-            for local_i, global_node in enumerate(boundary_node_ids):
-                for d in range(self.n_dim):
-                    global_dof = global_node * self.n_dim + d
-                    local_dof = local_i * self.n_dim + d
-                    F_global[global_dof] += f_boundary[local_dof]
+            # Vectorized: map local DOFs to global DOFs
+            _dim_range = torch.arange(
+                self.n_dim, device=boundary_node_ids.device)
+            global_dofs = (
+                boundary_node_ids.unsqueeze(1) * self.n_dim
+                + _dim_range).flatten()
+            F_global.index_add_(0, global_dofs, f_boundary)
 
-            # Collect boundary stiffness entries for sparse assembly
-            for local_i, global_node_i in enumerate(boundary_node_ids):
-                for d_i in range(self.n_dim):
-                    global_dof_i = global_node_i * self.n_dim + d_i
-                    local_dof_i = local_i * self.n_dim + d_i
-
-                    for local_j, global_node_j in enumerate(
-                            boundary_node_ids):
-                        for d_j in range(self.n_dim):
-                            global_dof_j = global_node_j * self.n_dim + d_j
-                            local_dof_j = local_j * self.n_dim + d_j
-
-                            k_indices.append(
-                                [global_dof_i, global_dof_j])
-                            k_values.append(
-                                k_boundary[local_dof_i, local_dof_j])
+            # Collect boundary stiffness entries (vectorized)
+            rows = global_dofs.unsqueeze(1).expand(
+                -1, n_dof_boundary).flatten()
+            cols = global_dofs.unsqueeze(0).expand(
+                n_dof_boundary, -1).flatten()
+            k_indices_list.append(
+                torch.stack([rows, cols]))
+            k_values_list.append(
+                k_boundary.flatten())
 
             # Store updated hidden states for stepwise mode
             if is_stepwise and hidden_states_trial is not None:
@@ -1620,8 +1641,9 @@ class FEM(ABC):
             # k[idx_patch] = stiffness_matrix
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Build global sparse stiffness matrix
-        k_indices_tensor = torch.tensor(k_indices, dtype=torch.long).T
-        k_values_tensor = torch.tensor(k_values)
+        k_indices_tensor = torch.cat(
+            k_indices_list, dim=1)
+        k_values_tensor = torch.cat(k_values_list)
         K_global = torch.sparse_coo_tensor(
             k_indices_tensor, k_values_tensor,
             (n_dof_global, n_dof_global)
@@ -1668,6 +1690,7 @@ class FEM(ABC):
         is_export_stiffness: bool = False,
         stiffness_output_dir: str | None = None,
         patch_size_label: str | None = None,
+        is_jacfwd_parallel: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | Tuple[
@@ -1786,30 +1809,23 @@ class FEM(ABC):
                         self._load_Graphorge_model(
                             model_directory=path,
                             device_type=dev))
-            # else:
-            #     # Single model (backward compat)
-            #     if model_directory is None:
-            #         model_directory = (
-            #             '/Users/rbarreira/Desktop/'
-            #             'machine_learning/'
-            #             'material_patches/'
-            #             'graphorge_material_patches/'
-            #             'src/graphorge/projects/'
-            #             'material_patches/elastic/'
-            #             '2d/quad4/mesh1x1/ninc1/'
-            #             '26.1_force_equilibrium_'
-            #             'npath10000/reference/'
-            #             '3_model')
-            #     model_cache['default'] = (
-            #         self._load_Graphorge_model(
-            #             model_directory=model_directory,
-            #             device_type=dev))
+            else:
+                # Single model (backward compat)
+                model_cache['default'] = (
+                    self._load_Graphorge_model(
+                        model_directory=model_directory,
+                        device_type=dev))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Enable stepwise mode on all cached models
             if is_stepwise:
                 for m in model_cache.values():
                     m._save_time_series_attrs()
                     m.set_rnn_mode(is_stepwise=True)
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Cache fast affine scaler parameters
+            for m in model_cache.values():
+                if hasattr(m, 'prepare_fast_scalers'):
+                    m.prepare_fast_scalers()
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Initialize patch IDs and topology
             patch_ids = torch.unique(
@@ -1907,7 +1923,9 @@ class FEM(ABC):
                             edge_feature_type,
                         model_cache=model_cache,
                         patch_resolution=
-                            patch_resolution)
+                            patch_resolution,
+                        is_jacfwd_parallel=
+                            is_jacfwd_parallel)
                     if is_stepwise:
                         surr_kwargs[
                             'hidden_states'] = (
@@ -1965,10 +1983,8 @@ class FEM(ABC):
                         for pid in patch_ids:
                             patch_key = \
                                 f"patch_{pid.item()}"
-                            hidden_states_dict[
-                                patch_key] = \
-                                hidden_state_out[
-                                    patch_key]
+                            hidden_states_dict[patch_key] = \
+                                hidden_state_out[patch_key]
                     # Save converged per-patch stiffness
                     if (is_export_stiffness
                             and stiffness_output_dir):
@@ -2103,29 +2119,14 @@ def compute_edge_features(coords_hist, disps_hist,
             n_edges, n_edge_features,
             device=coords_hist.device)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        current_coords_hist = coords_hist
-        for k in range(n_edges):
-            i = edge_sources[k]
-            j = edge_targets[k]
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # edge_vector: coords[i] - coords[j]
-            for t in range(n_time_steps):
-                s = t * n_dim
-                e = (t + 1) * n_dim
-                edge_features[k, s:e] = (
-                    current_coords_hist[i, s:e]
-                    - current_coords_hist[j, s:e])
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # relative_disp: disps[i] - disps[j]
-            if include_rel_disp:
-                for t in range(n_time_steps):
-                    s = t * n_dim
-                    e = (t + 1) * n_dim
-                    offset = edge_vector_size + s
-                    edge_features[k, offset:offset
-                                  + n_dim] = (
-                        disps_hist[i, s:e]
-                        - disps_hist[j, s:e])
+        # Vectorized edge feature computation
+        edge_features[:, :edge_vector_size] = (
+            coords_hist[edge_sources]
+            - coords_hist[edge_targets])
+        if include_rel_disp:
+            edge_features[:, edge_vector_size:] = (
+                disps_hist[edge_sources]
+                - disps_hist[edge_targets])
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return edge_features
 # =============================================================================
@@ -2152,6 +2153,14 @@ def forward_graph(
         """
         coords = coords_ref + disps
         node_features_in = torch.cat([coords, disps], dim=1)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Remove rigid body motions from input features
+        # (must happen before normalization to match
+        # training preprocessing)
+        if getattr(model, '_is_rigid_body_removal', False):
+            node_features_in = remove_rigid_body_motion(
+                model, node_features_in)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Derive n_edge_in from user-specified features
         n_edge_in = len(edge_feature_type) * n_dim
         # Recompute edge features based on updated coords
@@ -2160,48 +2169,89 @@ def forward_graph(
             n_edge_in=n_edge_in)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Forward pass with updated features
+        # Use fast affine scalers if available
+        _fast = getattr(model, '_fast_scalers_ready', False)
         # Stepwise forward mode
         if model._is_stepwise:
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Normalize updated node features
-            node_features_norm = model.stepwise_data_scaler_transform(
-                tensor=node_features_in,
-                features_type='node_features_in',
-                mode='normalize')
+            if _fast:
+                n_b = node_features_in.shape[-1]
+                node_features_norm = (
+                    node_features_in
+                    * model._fs_node_feat_in_s[:n_b]
+                    + model._fs_node_feat_in_o[:n_b])
+            else:
+                node_features_norm = (
+                    model.stepwise_data_scaler_transform(
+                        tensor=node_features_in,
+                        features_type='node_features_in',
+                        mode='normalize'))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Normalize updated edge features
-            edge_features_norm = model.stepwise_data_scaler_transform(
-                tensor=edge_features_in,
-                features_type='edge_features_in',
-                mode='normalize')
+            if _fast:
+                n_b = edge_features_in.shape[-1]
+                edge_features_norm = (
+                    edge_features_in
+                    * model._fs_edge_feat_in_s[:n_b]
+                    + model._fs_edge_feat_in_o[:n_b])
+            else:
+                edge_features_norm = (
+                    model.stepwise_data_scaler_transform(
+                        tensor=edge_features_in,
+                        features_type='edge_features_in',
+                        mode='normalize'))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Use stepwise forward method
-            node_output_norm, _, _, hidden_states_out = model.step(
-                node_features_in=node_features_norm,
-                edge_features_in=edge_features_norm,
-                global_features_in=global_features_in,
-                edges_indexes=edges_indexes)
+            node_output_norm, _, _, hidden_states_out = \
+                model.step(
+                    node_features_in=node_features_norm,
+                    edge_features_in=edge_features_norm,
+                    global_features_in=global_features_in,
+                    edges_indexes=edges_indexes)
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Denormalize output to get real forces
-            node_output_real = model.stepwise_data_scaler_transform(
-                tensor=node_output_norm,
-                features_type='node_features_out',
-                mode='denormalize')
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            if _fast:
+                n_b = node_output_norm.shape[-1]
+                node_output_real = (
+                    node_output_norm
+                    * model._fs_node_feat_out_is[:n_b]
+                    + model._fs_node_feat_out_io[:n_b])
+            else:
+                node_output_real = (
+                    model.stepwise_data_scaler_transform(
+                        tensor=node_output_norm,
+                        features_type='node_features_out',
+                        mode='denormalize'))
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             return node_output_real, hidden_states_out
         # Regular forward mode
         else:
             # Normalize updated node features
-            node_features_norm = model.data_scaler_transform(
-                tensor=node_features_in,
-                features_type='node_features_in',
-                mode='normalize')
+            if _fast:
+                node_features_norm = (
+                    node_features_in
+                    * model._fs_node_feat_in_s
+                    + model._fs_node_feat_in_o)
+            else:
+                node_features_norm = (
+                    model.data_scaler_transform(
+                        tensor=node_features_in,
+                        features_type='node_features_in',
+                        mode='normalize'))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Normalize updated edge features
-            edge_features_norm = model.data_scaler_transform(
-                tensor=edge_features_in,
-                features_type='edge_features_in',
-                mode='normalize')
+            if _fast:
+                edge_features_norm = (
+                    edge_features_in
+                    * model._fs_edge_feat_in_s
+                    + model._fs_edge_feat_in_o)
+            else:
+                edge_features_norm = (
+                    model.data_scaler_transform(
+                        tensor=edge_features_in,
+                        features_type='edge_features_in',
+                        mode='normalize'))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Use regular forward method
             node_output_norm, _, _ = model(
@@ -2212,9 +2262,16 @@ def forward_graph(
                 batch_vector=batch_vector)
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Denormalize output to get real forces
-            node_output_real = model.data_scaler_transform(
-                tensor=node_output_norm,
-                features_type='node_features_out',
-                mode='denormalize')
+            if _fast:
+                node_output_real = (
+                    node_output_norm
+                    * model._fs_node_feat_out_is
+                    + model._fs_node_feat_out_io)
+            else:
+                node_output_real = (
+                    model.data_scaler_transform(
+                        tensor=node_output_norm,
+                        features_type='node_features_out',
+                        mode='denormalize'))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             return node_output_real
