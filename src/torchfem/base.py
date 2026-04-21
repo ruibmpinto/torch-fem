@@ -1896,6 +1896,64 @@ class FEM(ABC):
             # # Reshape Jacobian to stiffness matrix format
             # stiffness_matrix = jacobian.view(n_dof_elem, n_dof_elem)
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # DEBUG corrections (toggle via attrs on self):
+            #   self._debug_symmetrize_K:
+            #       K -> 0.5*(K + K.T). Kills the
+            #       antisymmetric part of the
+            #       learned tangent so Newton
+            #       uses a symmetric operator.
+            #   self._debug_mean_force_removal:
+            #       For each spatial component,
+            #       subtract the per-node mean of
+            #       f_boundary. Enforces
+            #       sum(f_boundary) = 0 across
+            #       nodes (translational
+            #       equilibrium of the patch
+            #       boundary).
+            _sym_on = getattr(
+                self, '_debug_symmetrize_K', True)
+            _mfr_on = getattr(
+                self,
+                '_debug_mean_force_removal', True)
+            if _sym_on:
+                k_boundary = 0.5 * (
+                    k_boundary + k_boundary.T)
+            if _mfr_on:
+                _fn = f_boundary.view(
+                    n_boundary, self.n_dim)
+                _fmean = _fn.mean(dim=0)
+                f_boundary = (
+                    _fn - _fmean).flatten()
+            # One-shot post-correction log
+            _fix_seen = getattr(
+                self, '_fix_debug_seen', None)
+            if _fix_seen is None:
+                _fix_seen = set()
+                self._fix_debug_seen = _fix_seen
+            if patch_id not in _fix_seen:
+                _fix_seen.add(patch_id)
+                _Kc = k_boundary.detach()
+                _Kc_fro = float(torch.norm(_Kc))
+                _Kc_sym_err = float(
+                    torch.norm(_Kc - _Kc.T)
+                    / max(_Kc_fro, 1e-30))
+                _fc_norm = float(torch.norm(
+                    f_boundary))
+                _fn_now = f_boundary.view(
+                    n_boundary, self.n_dim)
+                _sum_now = _fn_now.sum(dim=0)
+                print(
+                    f'[FIX-DBG] {patch_id} '
+                    f'after corrections: '
+                    f'sym_on={_sym_on} '
+                    f'mfr_on={_mfr_on} '
+                    f'||K||_F={_Kc_fro:.4e} '
+                    f'||K-K^T||/||K||='
+                    f'{_Kc_sym_err:.3e} '
+                    f'||f||={_fc_norm:.4e} '
+                    f'sum(f_per_dim)='
+                    f'{_sum_now.tolist()}')
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Assemble boundary forces to global force vector
             # Vectorized: map local DOFs to global DOFs
             _dim_range = torch.arange(
