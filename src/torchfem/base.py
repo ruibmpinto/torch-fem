@@ -1804,6 +1804,91 @@ class FEM(ABC):
             # Store per-patch boundary stiffness
             patch_stiffness_dict[idx_patch] = \
                 k_boundary.detach().clone()
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # DEBUG: post-Jacobian diagnostics, once
+            # per patch per process. Tests:
+            #   - which model / resolution is used
+            #   - magnitudes of u, f, K at iter 1
+            #   - K symmetry (conservative elasticity
+            #     => K should be symmetric)
+            #   - zero-input forward: f(0) ≈ 0 ?
+            #   - FD-Jacobian vs jacfwd on col 0 only
+            _solve_seen = getattr(
+                self, '_solve_debug_seen', None)
+            if _solve_seen is None:
+                _solve_seen = set()
+                self._solve_debug_seen = _solve_seen
+            if patch_id not in _solve_seen:
+                _solve_seen.add(patch_id)
+                _res_tag = (
+                    patch_resolution[idx_patch]
+                    if (model_cache is not None
+                        and patch_resolution
+                        is not None) else 'default')
+                _mdl_repr = type(model).__name__
+                _u_norm = float(torch.norm(
+                    boundary_u_current))
+                _f_norm = float(torch.norm(
+                    f_boundary))
+                _K = k_boundary.detach()
+                _K_fro = float(torch.norm(_K))
+                _K_sym_err = float(torch.norm(
+                    _K - _K.T)
+                    / max(_K_fro, 1e-30))
+                _L_val = L.detach().cpu().numpy()
+                print(
+                    f'[SOLVE-DBG] {patch_id} '
+                    f'res={_res_tag} '
+                    f'model={_mdl_repr} L={_L_val}')
+                print(
+                    f'[SOLVE-DBG] {patch_id} '
+                    f'||u||={_u_norm:.4e} '
+                    f'||f||={_f_norm:.4e} '
+                    f'||K||_F={_K_fro:.4e} '
+                    f'||K-K^T||/||K||={_K_sym_err:.3e}')
+                # Zero-input sanity
+                _zero_u = torch.zeros_like(
+                    boundary_u_current)
+                _restore_h0()
+                _f0, _ = forward(_zero_u)
+                _f0_norm = float(torch.norm(_f0))
+                print(
+                    f'[SOLVE-DBG] {patch_id} '
+                    f'||f(u=0)||={_f0_norm:.4e} '
+                    f'(should be ~0 for a well-'
+                    f'trained surrogate with no '
+                    f'prior plastic history)')
+                # FD vs jacfwd for column 0
+                _eps = 1e-5 * max(
+                    _u_norm, 1.0)
+                _pert_p = boundary_u_current.clone()
+                _pert_m = boundary_u_current.clone()
+                _pert_p[0, 0] = (
+                    _pert_p[0, 0] + _eps)
+                _pert_m[0, 0] = (
+                    _pert_m[0, 0] - _eps)
+                _restore_h0()
+                _fp, _ = forward(_pert_p)
+                _restore_h0()
+                _fm, _ = forward(_pert_m)
+                _fd_col0 = (
+                    (_fp - _fm).flatten().detach()
+                    / (2.0 * _eps))
+                _K_col0 = _K[:, 0]
+                _diff = float(torch.norm(
+                    _fd_col0 - _K_col0))
+                _ref = float(torch.norm(_fd_col0))
+                _rel = _diff / max(_ref, 1e-30)
+                print(
+                    f'[SOLVE-DBG] {patch_id} '
+                    f'FD vs jacfwd col0: '
+                    f'||FD||={_ref:.4e} '
+                    f'||jacfwd||='
+                    f'{float(torch.norm(_K_col0)):.4e} '
+                    f'||diff||={_diff:.4e} '
+                    f'rel={_rel:.3e} '
+                    f'(rel<<1 => K matches ∂f/∂u; '
+                    f'rel~O(1) => K is broken)')
             # # OLD: Compute Jacobian for all element nodes
             # (jacobian, node_output) = torch_func.jacfwd(
             #     forward, has_aux=True)(elem_u_current)
