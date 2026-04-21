@@ -647,6 +647,7 @@ class FEM(ABC):
         device: str | None = None,
         return_intermediate: bool = True,
         aggregate_integration_points: bool = True,
+        aggregate_state: bool = None,
         use_cached_solve: bool = False,
         nlgeom: bool = False,
         return_volumes: bool = False,
@@ -811,9 +812,12 @@ class FEM(ABC):
                 volumes[n] = self.integrate_field()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Aggregate integration points as mean
+        if aggregate_state is None:
+            aggregate_state = aggregate_integration_points
         if aggregate_integration_points:
             defgrad = defgrad.mean(dim=1)
             stress = stress.mean(dim=1)
+        if aggregate_state:
             state = state.mean(dim=1)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Squeeze outputs
@@ -1379,8 +1383,10 @@ class FEM(ABC):
         self, model, u: Tensor, n: int,
         du: Tensor,
         is_stepwise: bool = False,
+        is_state_variable: bool = False,
         patch_ids: Tensor = None,
         hidden_states: dict = None,
+        state_variables: dict = None,
         edge_feature_type: tuple = ('edge_vector',),
         model_cache: dict = None,
         patch_resolution: dict = None,
@@ -1424,6 +1430,9 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize patch-specific hidden states output
         hidden_states_out = {}
+        # Initialize state variable outputs
+        state_var_out = {}
+        state_var_trial = {}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Update current displacement
         u[n] = u[n - 1] + du.view((-1, self.n_dim))
@@ -1473,6 +1482,87 @@ class FEM(ABC):
             # Get pre-computed edges_indexes for this patch
             edges_indexes = self._edges_indexes[patch_id]
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # DEBUG: node-ordering consistency check
+            # (once per patch_id per process)
+            _dbg_seen = getattr(
+                self, '_ordering_debug_seen', None)
+            if _dbg_seen is None:
+                _dbg_seen = set()
+                self._ordering_debug_seen = _dbg_seen
+            if patch_id not in _dbg_seen:
+                _dbg_seen.add(patch_id)
+                _coords = (boundary_coords_ref
+                           .detach().cpu().numpy())
+                _ei = edges_indexes.detach().cpu().numpy()
+                _src = _coords[_ei[0]]
+                _dst = _coords[_ei[1]]
+                _len = np.linalg.norm(
+                    _src - _dst, axis=1)
+                _span = _coords.max(axis=0) \
+                    - _coords.min(axis=0)
+                _bd_ids = (boundary_node_ids
+                           .detach().cpu().numpy())
+                print(
+                    f'[ORDER-DBG] {patch_id} '
+                    f'n_bd={len(_bd_ids)} '
+                    f'span={_span} '
+                    f'edge_len min={_len.min():.4e} '
+                    f'max={_len.max():.4e} '
+                    f'mean={_len.mean():.4e}')
+                _long = int((_len > 1.5
+                             * _len.min()).sum())
+                print(
+                    f'[ORDER-DBG] {patch_id} '
+                    f'edges_longer_than_1.5x_min='
+                    f'{_long}/{len(_len)}')
+                # Build nearest-neighbor edge set from
+                # boundary_coords_ref directly and
+                # compare to stored edges_indexes.
+                # Match => only permutation is wrong.
+                # Mismatch => graph topology itself
+                # is wrong on boundary_coords_ref.
+                _min_len = float(_len.min())
+                _tol = 1.1 * _min_len
+                _n = len(_coords)
+                _nn_edges = set()
+                for _i in range(_n):
+                    for _j in range(_i + 1, _n):
+                        _d = float(np.linalg.norm(
+                            _coords[_i]
+                            - _coords[_j]))
+                        if _d <= _tol:
+                            _nn_edges.add((_i, _j))
+                _stored = set()
+                for _k in range(_ei.shape[1]):
+                    _a = int(_ei[0, _k])
+                    _b = int(_ei[1, _k])
+                    if _a < _b:
+                        _stored.add((_a, _b))
+                    else:
+                        _stored.add((_b, _a))
+                _missing = _nn_edges - _stored
+                _extra = _stored - _nn_edges
+                print(
+                    f'[ORDER-DBG] {patch_id} '
+                    f'nn_edges={len(_nn_edges)} '
+                    f'stored={len(_stored)} '
+                    f'missing={len(_missing)} '
+                    f'extra={len(_extra)}')
+                if (len(_extra) > 0
+                        or len(_missing) > 0):
+                    print(
+                        f'[ORDER-DBG] {patch_id} '
+                        f'TOPOLOGY MISMATCH: stored '
+                        f'graph is NOT the physical '
+                        f'FE-mesh perimeter graph '
+                        f'on boundary_coords_ref')
+                else:
+                    print(
+                        f'[ORDER-DBG] {patch_id} '
+                        f'topology OK: graph edges '
+                        f'are physical neighbors '
+                        f'of boundary_coords_ref')
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # # OLD: Get material patch nodes (all nodes, not just boundary)
             # elem_nodes = self.elements[idx_patch]
             # # Current displacement at increment n
@@ -1484,36 +1574,71 @@ class FEM(ABC):
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             def detach_hidden_states(states):
                 if isinstance(states, dict):
-                    return {k: detach_hidden_states(v) for k, v in states.items()}
+                    return {
+                        k: detach_hidden_states(v)
+                        for k, v in states.items()}
                 elif isinstance(states, list):
-                    return [detach_hidden_states(item) for item in states]
+                    return [
+                        detach_hidden_states(item)
+                        for item in states]
                 elif torch.is_tensor(states):
                     return states.detach()
                 else:
                     return states
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Load patch-specific hidden states into model before inference
-            if is_stepwise and hidden_states and patch_id in hidden_states:
-                # patch_hidden = copy.deepcopy(hidden_states[patch_id])
-                patch_hidden = copy.deepcopy(
-                    detach_hidden_states(hidden_states[patch_id]))
-                model._gnn_epd_model._hidden_states = patch_hidden
-                # Set the model's hidden states to this patch's states
-                if 'encoder' in patch_hidden:
-                    model._gnn_epd_model._encoder._hidden_states = \
-                        patch_hidden['encoder']
-                if 'processor' in patch_hidden:
-                    model._gnn_epd_model._processor._hidden_states = \
-                        patch_hidden['processor']
-                    for i, layer in enumerate(
-                        model._gnn_epd_model._processor._processor):
-                        layer_key = f'layer_{i}'
-                        if layer_key in patch_hidden['processor']:
-                            layer._hidden_states = \
-                                patch_hidden['processor'][layer_key]
-                if 'decoder' in patch_hidden:
-                    model._gnn_epd_model._decoder._hidden_states = \
-                        patch_hidden['decoder']
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            def _load_hidden_into_model(mdl, h):
+                """Set hidden states on all model
+                sub-components."""
+                epd = mdl._gnn_epd_model
+                epd._hidden_states = h
+                if 'encoder' in h:
+                    epd._encoder._hidden_states = \
+                        h['encoder']
+                if 'processor' in h:
+                    epd._processor._hidden_states \
+                        = h['processor']
+                    for li, layer in enumerate(
+                            epd._processor
+                            ._processor):
+                        lk = f'layer_{li}'
+                        if lk in h['processor']:
+                            layer._hidden_states \
+                                = h['processor'][lk]
+                if 'decoder' in h:
+                    epd._decoder._hidden_states = \
+                        h['decoder']
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Snapshot h0 for this patch so it can be
+            # restored before every forward/jvp call
+            # (each call mutates model hidden states).
+            _h0_snapshot = None
+            if (is_stepwise and hidden_states
+                    and patch_id in hidden_states):
+                _h0_snapshot = copy.deepcopy(
+                    detach_hidden_states(
+                        hidden_states[patch_id]))
+                _load_hidden_into_model(
+                    model,
+                    copy.deepcopy(_h0_snapshot))
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            def _restore_h0():
+                """Reload h0 into model so the next
+                forward call sees the correct hidden
+                state."""
+                if _h0_snapshot is not None:
+                    _load_hidden_into_model(
+                        model,
+                        copy.deepcopy(
+                            detach_hidden_states(
+                                _h0_snapshot)))
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Retrieve epbar_prev for state variable mode
+            epbar_prev = None
+            if (is_state_variable
+                    and state_variables is not None
+                    and patch_id in state_variables):
+                epbar_prev = state_variables[
+                    patch_id].detach().clone()
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute patch coordinate rescaling to [0,1]^d
             # GNN trained on patches with coords in [0,1]^d; rescale inputs
@@ -1526,42 +1651,63 @@ class FEM(ABC):
             # Model prediction: stepwise vs non-stepwise mode
             hidden_states_trial = None
             def forward(disp_boundary):
-                """Forward function for gradient computation.
+                """Forward function for gradient
+                computation.
 
-                Rescales inputs to [0,1]^d for GNN inference,
-                then rescales forces back to physical space.
-                jacfwd differentiates through the full chain so
-                stiffness is automatically correct.
+                Rescales inputs to [0,1]^d for GNN
+                inference, then rescales forces back to
+                physical space. jacfwd differentiates
+                through the full chain so stiffness is
+                automatically correct.
 
-                Displacement centering removes rigid body
-                translation before 1/L scaling. Without this,
-                patches with L < 1 amplify the absolute
-                displacement (which includes the patch's
-                position-dependent rigid body component),
-                pushing normalized features far outside the
-                training distribution [-1, 1].
-
-                The Jacobian of centering is I - (1/N)*ones,
-                which projects out the uniform translation mode
-                from K. Dirichlet BCs remove the resulting null
-                space via _apply_constraints_sparse.
+                For state variable mode, epbar_prev is a
+                closure constant (not differentiated).
+                The Jacobian is w.r.t. disps only.
                 """
                 nonlocal hidden_states_trial
-                # # Center displacements to remove rigid body
-                # # translation before scaling by patch size
-                # disp_mean = disp_boundary.mean(
-                #     dim=0, keepdim=True)
-                # disp_centered = disp_boundary - disp_mean
                 disp_scaled = disp_boundary / L
-                if is_stepwise:
-                    pred_scaled, hidden_states_out = forward_graph(
+                if is_state_variable:
+                    # State variable mode: FFNN
+                    # epbar_prev captured as closure
+                    # constant — not differentiated
+                    epbar_sc = epbar_prev / L[:1]
+                    pred_scaled = forward_graph(
                         model=model,
                         disps=disp_scaled,
                         coords_ref=coords_scaled,
                         edges_indexes=edges_indexes,
                         n_dim=self.n_dim,
-                        edge_feature_type=edge_feature_type)
-                    hidden_states_trial = hidden_states_out
+                        edge_feature_type=(
+                            edge_feature_type),
+                        epbar_prev=epbar_sc)
+                    # Split output: forces | delta_raw
+                    n_d = self.n_dim
+                    forces_sc = pred_scaled[:, :n_d]
+                    delta_raw = pred_scaled[:, n_d:]
+                    # Monotonicity: softplus
+                    delta_epbar = torch.nn.functional \
+                        .softplus(delta_raw)
+                    epbar_new = (
+                        epbar_prev
+                        + delta_epbar * L[:1])
+                    # Store trial state variable
+                    state_var_trial[patch_id] = \
+                        epbar_new.detach()
+                    # Return forces only
+                    pred_real = forces_sc * L
+                    return (pred_real,
+                            pred_real.detach())
+                elif is_stepwise:
+                    pred_scaled, hs_out = (
+                        forward_graph(
+                            model=model,
+                            disps=disp_scaled,
+                            coords_ref=coords_scaled,
+                            edges_indexes=edges_indexes,
+                            n_dim=self.n_dim,
+                            edge_feature_type=(
+                                edge_feature_type)))
+                    hidden_states_trial = hs_out
                 else:
                     pred_scaled = forward_graph(
                         model=model,
@@ -1569,25 +1715,41 @@ class FEM(ABC):
                         coords_ref=coords_scaled,
                         edges_indexes=edges_indexes,
                         n_dim=self.n_dim,
-                        edge_feature_type=edge_feature_type)
-                # GNN predicts forces in scaled space; unscale to physical
+                        edge_feature_type=(
+                            edge_feature_type))
                 pred_real = pred_scaled * L
                 return pred_real, pred_real.detach()
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute Jacobian: d(forces_boundary)/d(u_boundary)
             if is_jacfwd_parallel:
-                # Parallel: all tangent vectors at once (high memory)
-                (jacobian, boundary_forces) = torch_func.jacfwd(
-                    forward, has_aux=True)(boundary_u_current)
+                # Parallel: all tangent vectors at once
+                _restore_h0()
+                (jacobian, boundary_forces) = \
+                    torch_func.jacfwd(
+                        forward,
+                        has_aux=True)(
+                        boundary_u_current)
                 k_boundary = jacobian.view(
                     n_dof_boundary, n_dof_boundary)
                 f_boundary = boundary_forces.flatten()
             else:
-                # Sequential: one jvp per DOF (constant memory)
-                boundary_forces, _ = forward(boundary_u_current)
-                f_boundary = boundary_forces.flatten().detach()
+                # Sequential: one jvp per DOF
+                # Restore h0 before force computation
+                _restore_h0()
+                boundary_forces, _ = forward(
+                    boundary_u_current)
+                f_boundary = (
+                    boundary_forces.flatten().detach())
+                # Save hidden_states_trial from the
+                # force eval — jvp calls would
+                # overwrite it with drifted values.
+                _hs_trial_saved = hidden_states_trial
                 cols = []
                 for i in range(n_dof_boundary):
+                    # Restore h0 before each jvp so
+                    # every column is linearized at
+                    # the same operating point.
+                    _restore_h0()
                     tangent = torch.zeros(
                         n_dof_boundary,
                         dtype=boundary_u_current.dtype)
@@ -1600,12 +1762,13 @@ class FEM(ABC):
                         (tangent,))
                     cols.append(
                         jvp_col.flatten().detach())
-                k_boundary = torch.stack(cols, dim=1)
+                k_boundary = torch.stack(
+                    cols, dim=1)
+                # Restore the correct hidden states
+                hidden_states_trial = _hs_trial_saved
             # Store per-patch boundary stiffness
             patch_stiffness_dict[idx_patch] = \
                 k_boundary.detach().clone()
-
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # # OLD: Compute Jacobian for all element nodes
             # (jacobian, node_output) = torch_func.jacfwd(
             #     forward, has_aux=True)(elem_u_current)
@@ -1635,6 +1798,11 @@ class FEM(ABC):
             # Store updated hidden states for stepwise mode
             if is_stepwise and hidden_states_trial is not None:
                 hidden_states_out[patch_id] = hidden_states_trial
+            # Store trial state variables
+            if (is_state_variable
+                    and patch_id in state_var_trial):
+                state_var_out[patch_id] = \
+                    state_var_trial[patch_id]
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # # OLD: Store element forces and stiffness
             # f[idx_patch] = node_forces_trial.flatten()
@@ -1658,6 +1826,10 @@ class FEM(ABC):
         if is_stepwise:
             return (K_global, F_global,
                     hidden_states_out,
+                    patch_stiffness_dict)
+        elif is_state_variable:
+            return (K_global, F_global,
+                    state_var_out,
                     patch_stiffness_dict)
         else:
             return (K_global, F_global,
@@ -1691,6 +1863,7 @@ class FEM(ABC):
         stiffness_output_dir: str | None = None,
         patch_size_label: str | None = None,
         is_jacfwd_parallel: bool = False,
+        is_state_variable: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | Tuple[
@@ -1750,8 +1923,14 @@ class FEM(ABC):
         """
         # Validate is_mat_patch tensor
         if is_mat_patch.shape[0] != self.n_elem:
-            raise ValueError(f'is_mat_patch shape {is_mat_patch.shape} ' + \
-                             f'must match number of elements {self.n_elem}')
+            raise ValueError(
+                f'is_mat_patch shape '
+                f'{is_mat_patch.shape} must match '
+                f'number of elements {self.n_elem}')
+        # Mutual exclusion
+        assert not (is_stepwise and is_state_variable), \
+            'is_stepwise and is_state_variable are ' \
+            'mutually exclusive'
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Number of increments
         N = len(increments)
@@ -1880,6 +2059,17 @@ class FEM(ABC):
                         'node': None,
                         'edge': None,
                         'global': None}}
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Initialize state variable dict (epbar)
+            state_var_dict = {}
+            if is_state_variable:
+                for pid in patch_ids:
+                    pid_int = pid.item()
+                    pk = f'patch_{pid_int}'
+                    n_bd = len(
+                        self.patch_bd_nodes[pid_int])
+                    state_var_dict[pk] = \
+                        torch.zeros(n_bd, 1)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Incremental loading
         for n in range(1, N):
@@ -1893,6 +2083,8 @@ class FEM(ABC):
             if return_resnorm:
                 residual_history[n] = []
             # Newton-Raphson iterations
+            _step_scale = 1.0
+            _prev_res = None
             for i in range(max_iter):
                 du[con] = DU[con]
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1911,6 +2103,7 @@ class FEM(ABC):
                 F_surr = None
                 patch_k_dict = {}
                 hidden_state_out = None
+                state_var_out = None
                 if has_surr:
                     patch_ids = torch.unique(
                         is_mat_patch[patch_mask])
@@ -1918,6 +2111,8 @@ class FEM(ABC):
                         model=None,
                         u=u, n=n, du=du,
                         is_stepwise=is_stepwise,
+                        is_state_variable=(
+                            is_state_variable),
                         patch_ids=patch_ids,
                         edge_feature_type=
                             edge_feature_type,
@@ -1932,6 +2127,16 @@ class FEM(ABC):
                             hidden_states_dict)
                         (K_surr, F_surr,
                          hidden_state_out,
+                         patch_k_dict) = \
+                            self \
+                            .surrogate_integrate_material(
+                            **surr_kwargs)
+                    elif is_state_variable:
+                        surr_kwargs[
+                            'state_variables'] = (
+                            state_var_dict)
+                        (K_surr, F_surr,
+                         state_var_out,
                          patch_k_dict) = \
                             self \
                             .surrogate_integrate_material(
@@ -1969,12 +2174,14 @@ class FEM(ABC):
                 # Save initial residual for relative error
                 if i == 0:
                     res_norm0 = res_norm
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Print iteration information
                 if verbose:
-                    print(f"Increment {n} | Iteration {i+1} | "
-                          f"Residual: {res_norm:.5e}")
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                    print(
+                        f'Increment {n} | '
+                        f'Iteration {i+1} | '
+                        f'Residual: {res_norm:.5e}')
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Check convergence
                 if res_norm < rtol * res_norm0 or res_norm < atol:
                     # Update patch-specific hidden states
@@ -1983,8 +2190,17 @@ class FEM(ABC):
                         for pid in patch_ids:
                             patch_key = \
                                 f"patch_{pid.item()}"
-                            hidden_states_dict[patch_key] = \
-                                hidden_state_out[patch_key]
+                            hidden_states_dict[
+                                patch_key] = \
+                                hidden_state_out[
+                                    patch_key]
+                    # Update state variables on
+                    # convergence
+                    if (is_state_variable
+                            and state_var_out):
+                        for pk in state_var_out:
+                            state_var_dict[pk] = \
+                                state_var_out[pk]
                     # Save converged per-patch stiffness
                     if (is_export_stiffness
                             and stiffness_output_dir):
@@ -2010,9 +2226,23 @@ class FEM(ABC):
                     cached_solve = CachedSolve()
                 # Only update cache on first iteration
                 update_cache = i == 0
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Solve for displacement increment
-                du -= sparse_solve(
+                # Adaptive step damping: if residual
+                # grew, halve the step; if it shrank,
+                # recover toward full step.
+                if (_prev_res is not None
+                        and res_norm > 1.01 * _prev_res):
+                    _step_scale = max(
+                        0.01, _step_scale * 0.5)
+                elif _prev_res is not None:
+                    _step_scale = min(
+                        1.0, _step_scale * 1.1)
+                _prev_res = res_norm.item()
+                # Break early on NaN
+                if torch.isnan(res_norm):
+                    break
+                delta_u = sparse_solve(
                     self.K,
                     residual,
                     None,
@@ -2023,10 +2253,14 @@ class FEM(ABC):
                     cached_solve,
                     update_cache,
                 )
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Raise an Exception if the model did not converge
-            if res_norm > rtol * res_norm0 and res_norm > atol:
-                raise Exception("Newton-Raphson iteration did not converge.")
+                du -= _step_scale * delta_u
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Raise an Exception if not converged
+            if (res_norm > rtol * res_norm0
+                    and res_norm > atol):
+                raise Exception(
+                    'Newton-Raphson iteration '
+                    'did not converge.')
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Update increment
             f[n] = F_int.reshape((-1, self.n_dim))
@@ -2133,7 +2367,8 @@ def compute_edge_features(coords_hist, disps_hist,
 def forward_graph(
         model, disps, coords_ref, edges_indexes, n_dim,
         batch_vector=None, global_features_in=None,
-        edge_feature_type=('edge_vector',)):
+        edge_feature_type=('edge_vector',),
+        epbar_prev=None):
         """Forward pass through GNN model with graph data reconstruction.
 
         Args:
@@ -2152,7 +2387,12 @@ def forward_graph(
             Tensor: Predicted nodal forces of shape (n_nodes, n_dim).
         """
         coords = coords_ref + disps
-        node_features_in = torch.cat([coords, disps], dim=1)
+        if epbar_prev is not None:
+            node_features_in = torch.cat(
+                [coords, disps, epbar_prev], dim=1)
+        else:
+            node_features_in = torch.cat(
+                [coords, disps], dim=1)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Remove rigid body motions from input features
         # (must happen before normalization to match
