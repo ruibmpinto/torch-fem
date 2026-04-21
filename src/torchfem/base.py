@@ -1483,7 +1483,19 @@ class FEM(ABC):
             edges_indexes = self._edges_indexes[patch_id]
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # DEBUG: node-ordering consistency check
-            # (once per patch_id per process)
+            # (once per patch_id per process).
+            #
+            # Works regardless of edge_type ('all' or
+            # 'bd'): tests whether
+            # boundary_coords_ref[k] coincides with
+            # the k-th position of the training-time
+            # column-major local pseudo-grid. That is
+            # the convention used by
+            # _create_mesh_nodes_matrix in
+            # run_simulation.py and
+            # _build_graph_topology in this file
+            # (both iterate i over x, j over y, so
+            # local-id k = i*(ny+1) + j).
             _dbg_seen = getattr(
                 self, '_ordering_debug_seen', None)
             if _dbg_seen is None:
@@ -1493,75 +1505,98 @@ class FEM(ABC):
                 _dbg_seen.add(patch_id)
                 _coords = (boundary_coords_ref
                            .detach().cpu().numpy())
-                _ei = edges_indexes.detach().cpu().numpy()
+                _bd_ids = (boundary_node_ids
+                           .detach().cpu().numpy())
+                _n = len(_coords)
+                # Shift to local-patch origin
+                _loc = _coords - _coords.min(axis=0)
+                # Recover element size per axis from
+                # unique coord values on the perimeter
+                _ux = np.unique(np.round(
+                    _loc[:, 0], 10))
+                _uy = np.unique(np.round(
+                    _loc[:, 1], 10))
+                _dx = float(np.min(np.diff(_ux))) \
+                    if len(_ux) > 1 else 1.0
+                _dy = float(np.min(np.diff(_uy))) \
+                    if len(_uy) > 1 else 1.0
+                _i = np.round(_loc[:, 0] / _dx) \
+                    .astype(int)
+                _j = np.round(_loc[:, 1] / _dy) \
+                    .astype(int)
+                _ny = int(_j.max())
+                # Column-major key: k = i*(ny+1) + j
+                _key = _i * (_ny + 1) + _j
+                # Permutation that, applied to the
+                # current boundary_node_ids order,
+                # yields column-major training order:
+                #   perm[k] = index in current order
+                #             of the k-th column-
+                #             major position.
+                _perm = np.argsort(_key)
+                _is_id = bool(np.array_equal(
+                    _perm, np.arange(_n)))
+                _span = _coords.max(axis=0) \
+                    - _coords.min(axis=0)
+                print(
+                    f'[ORDER-DBG] {patch_id} '
+                    f'n_bd={_n} span={_span} '
+                    f'dx={_dx:.4e} dy={_dy:.4e}')
+                print(
+                    f'[ORDER-DBG] {patch_id} '
+                    f'colmajor_perm_is_identity='
+                    f'{_is_id}')
+                if not _is_id:
+                    _n_fixed = int(
+                        (_perm == np.arange(_n))
+                        .sum())
+                    print(
+                        f'[ORDER-DBG] {patch_id} '
+                        f'ORDERING MISMATCH: '
+                        f'boundary_node_ids order '
+                        f'!= training col-major '
+                        f'order. Fixed points: '
+                        f'{_n_fixed}/{_n}. perm='
+                        f'{_perm.tolist()}')
+                    _bd_global = _bd_ids.tolist()
+                    _bd_colmaj = _bd_ids[_perm] \
+                        .tolist()
+                    print(
+                        f'[ORDER-DBG] {patch_id} '
+                        f'bd_ids (global-sorted) = '
+                        f'{_bd_global}')
+                    print(
+                        f'[ORDER-DBG] {patch_id} '
+                        f'bd_ids in col-major '
+                        f'order = {_bd_colmaj}')
+                else:
+                    print(
+                        f'[ORDER-DBG] {patch_id} '
+                        f'ordering OK: '
+                        f'boundary_node_ids '
+                        f'already in col-major '
+                        f'order')
+                # Edge-feature sanity print for
+                # edge_type=='all' (dense graph):
+                # report the edge-vector spread so
+                # user can sanity-check that edge
+                # attrs at inference are consistent
+                # with training coord range.
+                _ei = edges_indexes.detach() \
+                    .cpu().numpy()
                 _src = _coords[_ei[0]]
                 _dst = _coords[_ei[1]]
                 _len = np.linalg.norm(
                     _src - _dst, axis=1)
-                _span = _coords.max(axis=0) \
-                    - _coords.min(axis=0)
-                _bd_ids = (boundary_node_ids
-                           .detach().cpu().numpy())
                 print(
                     f'[ORDER-DBG] {patch_id} '
-                    f'n_bd={len(_bd_ids)} '
-                    f'span={_span} '
-                    f'edge_len min={_len.min():.4e} '
-                    f'max={_len.max():.4e} '
-                    f'mean={_len.mean():.4e}')
-                _long = int((_len > 1.5
-                             * _len.min()).sum())
-                print(
-                    f'[ORDER-DBG] {patch_id} '
-                    f'edges_longer_than_1.5x_min='
-                    f'{_long}/{len(_len)}')
-                # Build nearest-neighbor edge set from
-                # boundary_coords_ref directly and
-                # compare to stored edges_indexes.
-                # Match => only permutation is wrong.
-                # Mismatch => graph topology itself
-                # is wrong on boundary_coords_ref.
-                _min_len = float(_len.min())
-                _tol = 1.1 * _min_len
-                _n = len(_coords)
-                _nn_edges = set()
-                for _i in range(_n):
-                    for _j in range(_i + 1, _n):
-                        _d = float(np.linalg.norm(
-                            _coords[_i]
-                            - _coords[_j]))
-                        if _d <= _tol:
-                            _nn_edges.add((_i, _j))
-                _stored = set()
-                for _k in range(_ei.shape[1]):
-                    _a = int(_ei[0, _k])
-                    _b = int(_ei[1, _k])
-                    if _a < _b:
-                        _stored.add((_a, _b))
-                    else:
-                        _stored.add((_b, _a))
-                _missing = _nn_edges - _stored
-                _extra = _stored - _nn_edges
-                print(
-                    f'[ORDER-DBG] {patch_id} '
-                    f'nn_edges={len(_nn_edges)} '
-                    f'stored={len(_stored)} '
-                    f'missing={len(_missing)} '
-                    f'extra={len(_extra)}')
-                if (len(_extra) > 0
-                        or len(_missing) > 0):
-                    print(
-                        f'[ORDER-DBG] {patch_id} '
-                        f'TOPOLOGY MISMATCH: stored '
-                        f'graph is NOT the physical '
-                        f'FE-mesh perimeter graph '
-                        f'on boundary_coords_ref')
-                else:
-                    print(
-                        f'[ORDER-DBG] {patch_id} '
-                        f'topology OK: graph edges '
-                        f'are physical neighbors '
-                        f'of boundary_coords_ref')
+                    f'n_edges={_ei.shape[1]} '
+                    f'edge_len min={_len.min():.4e}'
+                    f' max={_len.max():.4e} '
+                    f'mean={_len.mean():.4e} '
+                    f'(note: with edge_type=all '
+                    f'the graph is ~dense, so edge-'
+                    f'length spread is expected)')
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # # OLD: Get material patch nodes (all nodes, not just boundary)
             # elem_nodes = self.elements[idx_patch]
