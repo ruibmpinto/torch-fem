@@ -1,24 +1,49 @@
 # Mac OS
 .DS_Store
 
-# Python 
-*.pyc 
-*.egg-info
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
 
-# Builds 
-build
-dist
+# Builds
+build/
+dist/
+site/
 
-# VS Code 
-.vscode
+# Virtual environments
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+
+# Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
 
 # Numpy files
 *.npy
 *.npz
 
-# Abaqus 
+# Abaqus
 *.inp
 
-# VTU files except for the ones in the folder data 
+# VTU files except for the ones in the folder data
 *.vtu
 !src/torchfem/data/*.vtu
+
+# Node (from legacy tooling)
+node_modules/
+package-lock.json
+package.json

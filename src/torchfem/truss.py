@@ -17,7 +17,7 @@ class Truss(FEM):
         super().__init__(nodes, elements, material)
 
         # Set up areas
-        self.areas = torch.ones((len(elements)))
+        self.areas = torch.ones(len(elements))
 
         # Element type
         if len(elements[0]) == 2:
@@ -54,7 +54,9 @@ class Truss(FEM):
 
         b = self.etype.B(xi)
         B = torch.einsum("jkl,lm->jkm", torch.linalg.inv(J), b)
-        B = torch.einsum("ijk,il->ijkl", B, cs).reshape(self.n_elem, -1)[:, None, :]
+        B = torch.einsum(
+            "ijk,il->ijkl", B, cs
+        ).reshape(self.n_elem, -1)[:, None, :]
 
         return self.etype.N(xi), B, detJ
 
@@ -64,7 +66,9 @@ class Truss(FEM):
 
     def compute_f(self, detJ: Tensor, B: Tensor, S: Tensor):
         """Element internal force vector."""
-        return torch.einsum("...,...,...ik,...ij->...kj", self.areas, detJ, B, S)
+        return torch.einsum(
+            "...,...,...ik,...ij->...kj", self.areas, detJ, B, S
+        )
 
     def plot(self, **kwargs):
         if self.n_dim == 2:
@@ -108,14 +112,19 @@ class Truss(FEM):
             if vmax is None:
                 vmax = max(float(element_property.max()), 0.0)
             color = cm((element_property - vmin) / (vmax - vmin))
-            sm = plt.cm.ScalarMappable(cmap=cm, norm=Normalize(vmin=vmin, vmax=vmax))
+            sm = plt.cm.ScalarMappable(
+                cmap=cm, norm=Normalize(vmin=vmin, vmax=vmax)
+            )
             plt.colorbar(sm, ax=ax, shrink=0.5)
         else:
             color = self.n_elem * [default_color]
 
         # Nodes
         pos = self.nodes + u
-        ax.scatter(pos[:, 0], pos[:, 1], color=default_color, marker="o", zorder=10)
+        ax.scatter(
+            pos[:, 0], pos[:, 1],
+            color=default_color, marker="o", zorder=10
+        )
         if node_labels:
             for i, node in enumerate(pos):
                 ax.annotate(
@@ -198,7 +207,9 @@ class Truss(FEM):
         for j, element in enumerate(self.elements):
             n1 = element[0]
             n2 = element[1]
-            tube = pyvista.Tube(pos[n1].numpy(), pos[n2].numpy(), radius=radii[j])
+            tube = pyvista.Tube(
+                pos[n1].numpy(), pos[n2].numpy(), radius=radii[j]
+            )
             if element_property is not None:
                 for key, value in element_property.items():
                     value = element_property[key].squeeze()

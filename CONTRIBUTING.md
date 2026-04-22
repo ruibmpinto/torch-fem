@@ -1,18 +1,58 @@
 # Contributing to torch-fem
 
-Thank you for considering contributing to torch-fem! We appreciate your time and effort. Here’s a quick guide to help you get started.
+Thank you for considering contributing to `torch-fem`. This document
+summarises the workflow and coding standards expected for any change to
+this repository.
 
-## Reporting Issues
-- If you find a bug or have a feature request, please open an issue in the [Issues](https://github.com/meyer-nils/torch-fem/issues) section.
-- Provide as much detail as possible (screenshot, minimal working example, etc.) to help us understand and reproduce the issue.
+## Reporting issues
 
-## Making Changes
-1. **Fork the repository**: Create your own fork of the repo by clicking "Fork" at the top right of the project page.
-2. **Commit changes in your personal fork**: Ensure your commit messages are clear and descriptive.
-3. **Test your changes**: If applicable, run the existing tests and add new ones if you’ve introduced new functionality.
-4. **Submit a Pull Request (PR)**: Go to the main repository and click "New Pull Request." Provide a description of your changes and reference any related issue numbers.
+- If you find a bug or have a feature request, please open an issue on the
+  [GitHub issue tracker](https://github.com/ruibmpinto/torch-fem/issues).
+- Provide as much context as possible: a minimal working example, the
+  expected and observed behaviour, the Python / PyTorch version, and the
+  operating system.
 
-## Code Style
-- Follow the [black](https://github.com/psf/black) coding style for Python.
-- Keep code clean and modular.
-- Use type annotations. 
+## Development workflow
+
+1. **Fork** the repository and create a feature branch from `main`.
+2. **Install** the project in editable mode with all optional
+   dependencies:
+   ```bash
+   conda activate env_torchfem
+   pip install -e ".[dev,tests,docs]"
+   ```
+3. **Make your changes** in small, logically isolated commits with clear
+   messages.
+4. **Run the full quality pipeline** before opening a pull request:
+   ```bash
+   make format   # auto-fix formatting
+   make lint     # 0 errors expected
+   make test     # all tests must pass
+   make docs     # documentation builds without errors
+   make build    # source and wheel distributions build cleanly
+   ```
+5. **Submit a pull request** against `main` and reference any related
+   issue numbers.
+
+## Coding style
+
+This repository follows the
+[Bessa Research Group (BRG) Python Development Code of Conduct](https://github.com/bessagroup/python_code_of_conduct).
+The main points are:
+
+- **Line length:** 79 characters.
+- **Indentation:** 4 spaces, never tabs.
+- **String quotes:** single quotes for regular strings, double quotes for
+  triple-quoted strings (docstrings).
+- **Naming:** `snake_case` for variables, functions and modules;
+  `UpperCamelCase` for classes; a single leading underscore for
+  non-public members.
+- **Imports:** one per line, absolute, grouped as (1) standard library,
+  (2) third-party, (3) local. No wildcard imports.
+- **Docstrings:** NumPy style for every module, class, function and
+  method. Document parameters, return values and raised exceptions.
+- **Comments:** block comments only, no inline comments.
+
+Compliance is enforced automatically by `ruff`; the exact configuration
+lives under `[tool.ruff]` in `pyproject.toml`. A contribution is
+acceptable only if `make lint` reports zero errors.

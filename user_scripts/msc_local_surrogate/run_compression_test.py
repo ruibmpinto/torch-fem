@@ -1,12 +1,13 @@
-import torch
-import numpy as np
 import os
-import sys
 import pathlib
+import sys
+
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
 
 # Get the current working directory and build the path
-graphorge_path = str(pathlib.Path(os.getcwd()).parents[1] / 
+graphorge_path = str(pathlib.Path(os.getcwd()).parents[1] /
                      "graphorge_material_patches" / "src")
 if graphorge_path not in sys.path:
     sys.path.insert(0, graphorge_path)
@@ -19,9 +20,9 @@ if msc_path not in sys.path:
 from minimal_state_cell_c import MSC
 
 from torchfem import Solid
+from torchfem.elements import Hexa1r
 from torchfem.materials import IsotropicPlasticity3D
 from torchfem.mesh import cube_hexa
-from torchfem.elements import Hexa1r
 
 torch.set_default_dtype(torch.float64)
 
@@ -35,12 +36,12 @@ def run_compression_test():
         sigma_y = 250.0  # Initial yield stress
         H = 1000.0       # Hardening modulus
         return sigma_y + H * eps_p
-    
+
     def sigma_f_prime(eps_p):
         """Derivative of yield stress"""
         H = 1000.0
         return H
-    
+
     material = IsotropicPlasticity3D(
         E=210000.0,
         nu=0.3,
@@ -83,15 +84,15 @@ def run_compression_test():
                     output_activation='Tanh',
                     return_state=True,
                     return_sequences=False)
-    model_path = f'/Users/rbarreira/Desktop/machine_learning/msc/' + \
-        f'trained_msc_u7_d4_w25_e1500_batch64_lrinit0.005_lrrate0.03_lrpower0.5'
+    model_path = '/Users/rbarreira/Desktop/machine_learning/msc/' + \
+        'trained_msc_u7_d4_w25_e1500_batch64_lrinit0.005_lrrate0.03_lrpower0.5'
     msc_model.load_state_dict(torch.load(model_path, weights_only=True))
     msc_model.eval()
-    
+
     # Override element type to use Hexa1r (reduced integration)
     model.etype = Hexa1r()
     # Update integration points
-    model.n_int = len(model.etype.iweights())  
+    model.n_int = len(model.etype.iweights())
     # Solve with MSC
     u_msc, f_msc, _, _, _ = model.solve_msc(
         msc_model=msc_model,
@@ -108,18 +109,18 @@ def run_compression_test():
     # Output results
     output_dir = 'results/cube_compression_msc'
     os.makedirs(output_dir, exist_ok=True)
-    
+
     # Calculate forces on bottom face and displacement of top face
     bottom_force_msc = []
     top_displacement = []
     for i in range(len(increments)):
         # Sum forces on bottom nodes (z-direction)
         bottom_force_msc.append(torch.sum(f_msc[i][bottom_nodes, 2]).item())
-        
+
         # Get displacement of first top node
         top_node_idx = torch.where(top_nodes)[0][0]
         top_displacement.append(u_msc[i][top_node_idx, 2].item())
-    
+
     # Plot force vs displacement
     plt.figure(figsize=(6, 6))
     plt.plot(top_displacement, bottom_force_msc, 'r--', label='MSC')

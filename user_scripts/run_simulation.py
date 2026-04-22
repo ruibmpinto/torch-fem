@@ -20,13 +20,15 @@ run_simulation
 # Standard
 import math
 import os
-import sys
 import pathlib
 import pickle as pkl
+import sys
+
 # Third-party
 import numpy as np
 import torch
 import torch.func as torch_func
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Add graphorge to sys.path
 graphorge_path = str(
@@ -36,38 +38,35 @@ if graphorge_path not in sys.path:
     sys.path.insert(0, graphorge_path)
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Local
-from torchfem import Solid, Planar
-from torchfem.materials import (
-    IsotropicElasticityPlaneStrain,
-    IsotropicElasticityPlaneStress,
-    IsotropicPlasticityPlaneStrain,
-    IsotropicPlasticityPlaneStrainUMAT,
-    IsotropicPlasticityPlaneStress,
-    IsotropicElasticity3D,
-    IsotropicPlasticity3D,
-    IsotropicPlasticity3DUMAT,
-    IsotropicHencky3D,
-    Hyperelastic3D,
-    IsotropicHenckyPlaneStrain
-)
-from torchfem.custom_materials.lou_zhang_yoon import (
-    LouZhangYoon3D, LouZhangYoonPlaneStrain
-)
-from torchfem.mesh import cube_hexa, rect_quad
-from torchfem.elements import (
-    linear_to_quadratic, Hexa1r, Quad1r
-)
-from utils.boundary_conditons import (
-    prescribe_disps_by_coords
-)
-from utils.mechanical_quantities import (
-    compute_strain_energy_density
-)
+from utils.boundary_conditons import prescribe_disps_by_coords
+from utils.mechanical_quantities import compute_strain_energy_density
 from utils.plotting import (
     plot_displacement_field,
     plot_domain_displacements,
-    plot_shape_functions
+    plot_shape_functions,
 )
+
+from torchfem import Planar, Solid
+from torchfem.custom_materials.lou_zhang_yoon import (
+    LouZhangYoon3D,
+    LouZhangYoonPlaneStrain,
+)
+from torchfem.elements import Hexa1r, Quad1r, linear_to_quadratic
+from torchfem.materials import (
+    Hyperelastic3D,
+    IsotropicElasticity3D,
+    IsotropicElasticityPlaneStrain,
+    IsotropicElasticityPlaneStress,
+    IsotropicHencky3D,
+    IsotropicHenckyPlaneStrain,
+    IsotropicPlasticity3D,
+    IsotropicPlasticity3DUMAT,
+    IsotropicPlasticityPlaneStrain,
+    IsotropicPlasticityPlaneStrainUMAT,
+    IsotropicPlasticityPlaneStress,
+)
+from torchfem.mesh import cube_hexa, rect_quad
+
 #
 #                                                          Authorship & Credits
 # =============================================================================

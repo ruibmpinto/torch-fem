@@ -49,7 +49,9 @@ class CachedSolve:
         self.previous_grad = previous_grad
 
     def update_grad(self, grad):
-        self.previous_grad = grad.detach().clone() if grad is not None else None
+        self.previous_grad = (
+            grad.detach().clone() if grad is not None else None
+        )
 
     def update_x(self, x):
         self.previous_x = x.detach().clone() if x is not None else None
@@ -81,20 +83,22 @@ class Solve(Function):
         Args:
             A (sparse_coo_tensor): Sparse matrix A.
             b (Tensor): Right-hand side vector b.
-            B (Tensor, optional): Null space rigid body modes for AMG preconditioner.
-            rtol (float, optional): Relative tolerance for the iterative solver.
-                Defaults to 1e-10.
-            device (str, optional): Device to run the computation on ('cpu' or 'cuda').
-                Defaults to None, which uses the current device.
-            method (str, optional): Method to use for solving ('spsolve', 'minres',
-                'cg', 'pardiso'). Defaults to None for automatic selection based on the
-                input size and available backends.
+            B (Tensor, optional): Null space rigid body modes for
+                AMG preconditioner.
+            rtol (float, optional): Relative tolerance for the
+                iterative solver. Defaults to 1e-10.
+            device (str, optional): Device to run on ('cpu' or
+                'cuda'). Defaults to None (uses current device).
+            method (str, optional): Method to use for solving
+                ('spsolve', 'minres', 'cg', 'pardiso'). Defaults to
+                None for automatic selection based on size and
+                available backends.
             M (Tensor, optional): Preconditioner matrix for iterative methods.
                 Defaults to None.
-            cached_solve (CachedSolve, optional): Cache for the previous solution and
-                gradient. Defaults to an empty cache.
-            update_cache (bool, optional): Whether to update the cached solution
-                after the forward pass. Defaults to False.
+            cached_solve (CachedSolve, optional): Cache for the previous
+                solution and gradient. Defaults to an empty cache.
+            update_cache (bool, optional): Whether to update the
+                cached solution after the forward pass. Defaults to False.
         Returns:
             Tensor: Solution vector x.
         """
@@ -105,7 +109,9 @@ class Solve(Function):
         out_device = b.device
 
         # Check the input method
-        if method is not None and method not in ["spsolve", "minres", "cg", "pardiso"]:
+        if method is not None and method not in [
+            "spsolve", "minres", "cg", "pardiso"
+        ]:
             raise ValueError(
                 f"Method {method} is not supported. "
                 "Choose from 'spsolve', 'minres', 'cg', or 'pardiso'."
@@ -119,7 +125,8 @@ class Solve(Function):
         # Make default solver choice based on shape and available backends
         if method is None:
             if shape[0] < 10000:
-                if A.device.type == "cpu" and "pypardiso" in available_backends:
+                if (A.device.type == "cpu"
+                        and "pypardiso" in available_backends):
                     method = "pardiso"
                 else:
                     method = "spsolve"
@@ -128,12 +135,18 @@ class Solve(Function):
 
         # Solve either on CPU or GPU
         if A.device.type == "cuda":
-            x_xp = Solve._solve_gpu(A, b, B, method, rtol, M, shape, cached_solve)
+            x_xp = Solve._solve_gpu(
+                A, b, B, method, rtol, M, shape, cached_solve
+            )
         else:
-            x_xp = Solve._solve_cpu(A, b, B, method, rtol, M, shape, cached_solve)
+            x_xp = Solve._solve_cpu(
+                A, b, B, method, rtol, M, shape, cached_solve
+            )
 
         # Convert back to torch
-        x = torch.tensor(x_xp, requires_grad=True, dtype=b.dtype, device=out_device)
+        x = torch.tensor(
+            x_xp, requires_grad=True, dtype=b.dtype, device=out_device
+        )
 
         # Update cached solve with the current solution
         if update_cache:
@@ -263,17 +276,23 @@ class Solve(Function):
         elif method == "minres":
             # AMG preconditioner with Jacobi smoother
             if M is None:
-                ml = pyamg.smoothed_aggregation_solver(A_np, B_np, smooth="jacobi")
+                ml = pyamg.smoothed_aggregation_solver(
+                    A_np, B_np, smooth="jacobi"
+                )
                 M = ml.aspreconditioner()
 
             # Solve with minres
-            x_xp, exit_code = scipy_minres(A_np, b_np, M=M, rtol=rtol, x0=x0_np)
+            x_xp, exit_code = scipy_minres(
+                A_np, b_np, M=M, rtol=rtol, x0=x0_np
+            )
             if exit_code != 0:
                 raise RuntimeError(f"minres failed with exit code {exit_code}")
         elif method == "cg":
             # AMG preconditioner with Jacobi smoother
             if M is None:
-                ml = pyamg.smoothed_aggregation_solver(A_np, B_np, smooth="jacobi")
+                ml = pyamg.smoothed_aggregation_solver(
+                    A_np, B_np, smooth="jacobi"
+                )
                 M = ml.aspreconditioner()
 
             # Solve with minres
@@ -299,9 +318,13 @@ def sparse_index_select(t: Tensor, slices: list[Tensor | None]) -> Tensor:
         else:
             out_shape.append(len(slice))
             mask = torch.isin(indices[dim], slice)
-            cumsum = torch.cumsum(torch.isin(torch.arange(0, in_shape[dim]), slice), 0)
+            cumsum = torch.cumsum(
+                torch.isin(torch.arange(0, in_shape[dim]), slice), 0
+            )
             indices = indices[:, mask]
             values = values[mask]
             indices[dim] = cumsum[indices[dim]] - 1
 
-    return torch.sparse_coo_tensor(indices, values, out_shape, is_coalesced=coalesced)
+    return torch.sparse_coo_tensor(
+        indices, values, out_shape, is_coalesced=coalesced
+    )

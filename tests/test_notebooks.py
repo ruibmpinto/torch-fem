@@ -91,7 +91,9 @@ def test_planar_topology_optimization_notebook(tb):
     tb.execute()
 
 
-@testbook("examples/optimization/solid/topology.ipynb", execute=True, timeout=180)
+@testbook(
+    "examples/optimization/solid/topology.ipynb", execute=True, timeout=180
+)
 def test_solid_topology_optimization_notebook(tb):
     tb.execute()
 

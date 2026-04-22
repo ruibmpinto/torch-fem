@@ -11,8 +11,8 @@ def IBOF_closure(A2: Tensor) -> Tensor:
     """IBOF closure [1]. This is a PyTorch re-implementation of fiberoripy [2].
 
     [1] Du Hwan Chung and Tai Hun Kwon (2002)
-        'Invariant-based optimal fitting closure approximation for the numerical
-        prediction of flow-induced fiber orientation',
+        'Invariant-based optimal fitting closure approximation for the
+        numerical prediction of flow-induced fiber orientation',
         Journal of Rheology 46(1):169-194,
         https://doi.org/10.1122/1.1423312
 
@@ -246,11 +246,16 @@ def IBOF_closure(A2: Tensor) -> Tensor:
         symm(torch.einsum("..., ij,kl->...ijkl", beta1, delta, delta))
         + symm(torch.einsum("..., ij, ...kl-> ...ijkl", beta2, delta, A2))
         + symm(torch.einsum("..., ...ij, ...kl -> ...ijkl", beta3, A2, A2))
-        + symm(torch.einsum("..., ij, ...km, ...ml -> ...ijkl", beta4, delta, A2, A2))
-        + symm(torch.einsum("..., ...ij, ...km, ...ml -> ...ijkl", beta5, A2, A2, A2))
+        + symm(torch.einsum(
+            "..., ij, ...km, ...ml -> ...ijkl", beta4, delta, A2, A2
+        ))
+        + symm(torch.einsum(
+            "..., ...ij, ...km, ...ml -> ...ijkl", beta5, A2, A2, A2
+        ))
         + symm(
             torch.einsum(
-                "..., ...im, ...mj, ...kn, ...nl -> ...ijkl", beta6, A2, A2, A2, A2
+                "..., ...im, ...mj, ...kn, ...nl -> ...ijkl",
+                beta6, A2, A2, A2, A2,
             )
         )
     )
@@ -270,16 +275,19 @@ def symm(A4: Tensor) -> Tensor:
     Returns:
         Tensor: Symmetrized outout tensor
     """
-    B4 = torch.stack([torch.permute(A4, (0, *p)) for p in permutations([1, 2, 3, 4])])
+    B4 = torch.stack(
+        [torch.permute(A4, (0, *p)) for p in permutations([1, 2, 3, 4])]
+    )
     return B4.sum(dim=0) / 24
 
 
 def compute_orientation_average(C: Tensor, A2: Tensor, A4: Tensor) -> Tensor:
-    """Orientation averaging according to Advani and Tucker [1]. See also homopy [2].
+    """Orientation averaging according to Advani and Tucker [1].
+    See also homopy [2].
 
     [1] Suresh G. Advani, Charles L. Tucker (1987)
-        'The Use of Tensors to Describe and Predict Fiber Orientation in Short Fiber
-        Composites',
+        'The Use of Tensors to Describe and Predict Fiber Orientation
+        in Short Fiber Composites',
         Journal of Rheology, 31 (8): 751-78
         https://doi.org/10.1122/1.549945
 
@@ -290,7 +298,8 @@ def compute_orientation_average(C: Tensor, A2: Tensor, A4: Tensor) -> Tensor:
     Args:
         C (torch.tensor): Stiffness tensor (shape 3x3x3x3)
         A2 (torch.tensor): Second order fiber orientation tensors (shape Nx3x3)
-        A4 (torch.tensor): Fourth order fiber orientation tensors (shape Nx3x3x3x3)
+        A4 (torch.tensor): Fourth order fiber orientation tensors
+            (shape Nx3x3x3x3)
 
     Returns:
         torch.tensor: Orientation averaged stiffness tensor (shape Nx3x3x3x3)
@@ -330,7 +339,10 @@ def compute_orientation_average(C: Tensor, A2: Tensor, A4: Tensor) -> Tensor:
         )
         + B4 * torch.einsum("ij,kl->ijkl", Id, Id)
         + B5
-        * (torch.einsum("ik,jl->ijkl", Id, Id) + torch.einsum("il,jk->ijkl", Id, Id))
+        * (
+            torch.einsum("ik,jl->ijkl", Id, Id)
+            + torch.einsum("il,jk->ijkl", Id, Id)
+        )
     )
 
     return C
@@ -339,8 +351,8 @@ def compute_orientation_average(C: Tensor, A2: Tensor, A4: Tensor) -> Tensor:
 def tandon_weng_homogenization(
     matrix: IsotropicElasticity3D, fiber: IsotropicElasticity3D, a, volfrac
 ) -> OrthotropicElasticity3D:
-    """Compute transversly isotropic material based on Tandon-Wengs's paper [1]. See
-    also [2] for more general Mori-Tanka approach.
+    """Compute transversly isotropic material based on Tandon-Wengs's
+    paper [1]. See also [2] for more general Mori-Tanka approach.
 
     [1] Tandon, G.P. and Weng, G.J. (1984)
         'The effect of aspect ratio of inclusions on the elastic properties of
@@ -381,24 +393,35 @@ def tandon_weng_homogenization(
     S[0, 0, 0, 0] = (
         1
         / (2 * c)
-        * (1 - 2 * nu0 + (3 * a**2 - 1) / b - (1 - 2 * nu0 + (3 * a**2) / b) * g)
+        * (
+            1 - 2 * nu0 + (3 * a**2 - 1) / b
+            - (1 - 2 * nu0 + (3 * a**2) / b) * g
+        )
     )
     S[1, 1, 1, 1] = (
         3 / (8 * c) * a**2 / b + 1 / (4 * c) * (1 - 2 * nu0 - 9 / (4 * b)) * g
     )
-    S[1, 1, 2, 2] = 1 / (4 * c) * (a**2 / (2 * b) - (1 - 2 * nu0 + 3 / (4 * b)) * g)
+    S[1, 1, 2, 2] = (
+        1 / (4 * c) * (a**2 / (2 * b) - (1 - 2 * nu0 + 3 / (4 * b)) * g)
+    )
     S[1, 1, 0, 0] = (
-        -1 / (2 * c) * a**2 / b + 1 / (4 * c) * (3 * a**2 / b - (1 - 2 * nu0)) * g
+        -1 / (2 * c) * a**2 / b
+        + 1 / (4 * c) * (3 * a**2 / b - (1 - 2 * nu0)) * g
     )
     S[0, 0, 1, 1] = (
         -1 / (2 * c) * (1 - 2 * nu0 + 1 / b)
         + 1 / (2 * c) * (1 - 2 * nu0 + 3 / (2 * b)) * g
     )
-    S[1, 2, 1, 2] = 1 / (4 * c) * (a**2 / (2 * b) + (1 - 2 * nu0 - 3 / (4 * b)) * g)
+    S[1, 2, 1, 2] = (
+        1 / (4 * c) * (a**2 / (2 * b) + (1 - 2 * nu0 - 3 / (4 * b)) * g)
+    )
     S[0, 1, 0, 1] = (
         1
         / (4 * c)
-        * (1 - 2 * nu0 - (a**2 + 1) / b - 0.5 * (1 - 2 * nu0 - 3 * (a**2 + 1) / b) * g)
+        * (
+            1 - 2 * nu0 - (a**2 + 1) / b
+            - 0.5 * (1 - 2 * nu0 - 3 * (a**2 + 1) / b) * g
+        )
     )
     S[2, 2, 2, 2] = S[1, 1, 1, 1]
     S[2, 2, 1, 1] = S[1, 1, 2, 2]
@@ -413,13 +436,19 @@ def tandon_weng_homogenization(
     D3 = lambda0 / (lambda1 - lambda0)
 
     # B Coefficients
-    B1 = volfrac * D1 + D2 + (1 - volfrac) * (D1 * S[0, 0, 0, 0] + 2 * S[1, 1, 0, 0])
+    B1 = (
+        volfrac * D1 + D2
+        + (1 - volfrac) * (D1 * S[0, 0, 0, 0] + 2 * S[1, 1, 0, 0])
+    )
     B2 = (
         volfrac
         + D3
         + (1 - volfrac) * (D1 * S[0, 0, 1, 1] + S[1, 1, 1, 1] + S[1, 1, 2, 2])
     )
-    B3 = volfrac + D3 + (1 - volfrac) * (S[0, 0, 0, 0] + (1 + D1) * S[1, 1, 0, 0])
+    B3 = (
+        volfrac + D3
+        + (1 - volfrac) * (S[0, 0, 0, 0] + (1 + D1) * S[1, 1, 0, 0])
+    )
     B4 = (
         volfrac * D1
         + D2
@@ -441,13 +470,24 @@ def tandon_weng_homogenization(
 
     # Engineering constants
     E11 = E0 / (1 + volfrac * (A1 + 2 * nu0 * A2) / A)
-    E22 = E0 / (1 + volfrac * (-2 * nu0 * A3 + c * A4 + (1 + nu0) * A5 * A) / (2 * A))
+    E22 = E0 / (
+        1 + volfrac * (-2 * nu0 * A3 + c * A4 + (1 + nu0) * A5 * A) / (2 * A)
+    )
     E33 = E22
-    G12 = G0 * (1 + volfrac / (G0 / (G1 - G0) + 2 * (1 - volfrac) * S[0, 1, 0, 1]))
-    G23 = G0 * (1 + volfrac / (G0 / (G1 - G0) + 2 * (1 - volfrac) * S[1, 2, 1, 2]))
+    G12 = G0 * (
+        1 + volfrac / (G0 / (G1 - G0) + 2 * (1 - volfrac) * S[0, 1, 0, 1])
+    )
+    G23 = G0 * (
+        1 + volfrac / (G0 / (G1 - G0) + 2 * (1 - volfrac) * S[1, 2, 1, 2])
+    )
     G13 = G12
-    nu12 = (nu0 * A - volfrac * (A3 - nu0 * A4)) / (A + volfrac * (A1 + 2 * nu0 * A2))
+    nu12 = (
+        (nu0 * A - volfrac * (A3 - nu0 * A4))
+        / (A + volfrac * (A1 + 2 * nu0 * A2))
+    )
     nu23 = E22 / (2 * G23) - 1
     nu13 = nu12
 
-    return OrthotropicElasticity3D(E11, E22, E33, nu12, nu13, nu23, G12, G13, G23)
+    return OrthotropicElasticity3D(
+        E11, E22, E33, nu12, nu13, nu23, G12, G13, G23
+    )

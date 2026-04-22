@@ -20,10 +20,10 @@ plot_eigenmodes
 #                                                          Modules
 # =============================================================================
 # Standard
-import os
-import sys
 import copy
+import os
 import pathlib
+import sys
 
 # Add graphorge to sys.path
 graphorge_path = str(
@@ -33,25 +33,24 @@ if graphorge_path not in sys.path:
     sys.path.insert(0, graphorge_path)
 
 # Third-party
-import torch
-import torch.func as torch_func
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import torch.func as torch_func
 
 # Enable graphorge imports in torchfem
 os.environ['TORCHFEM_IMPORT_GRAPHORGE'] = '1'
 
 # Local
-from graphorge.gnn_base_model.model.gnn_model \
-    import GNNEPDBaseModel
-from graphorge.gnn_base_model.data.graph_data \
-    import GraphData
+from graphorge.gnn_base_model.data.graph_data import GraphData
+from graphorge.gnn_base_model.model.gnn_model import GNNEPDBaseModel
 from graphorge.projects.material_patches \
-    .gnn_model_tools.gen_graphs_files \
-    import (get_elem_size_dims,
-            get_mesh_connected_nodes)
-from torchfem.base import (
-    forward_graph, compute_edge_features)
+    .gnn_model_tools.gen_graphs_files import (
+    get_elem_size_dims,
+    get_mesh_connected_nodes,
+)
+
+from torchfem.base import compute_edge_features, forward_graph
 
 # Matplotlib defaults
 plt.rcParams.update({

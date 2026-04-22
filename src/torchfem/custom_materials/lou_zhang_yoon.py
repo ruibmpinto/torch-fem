@@ -48,11 +48,13 @@ the scalar apex residual.
 # =============================================================================
 # Standard
 import math
+
 # Third-party
 import torch
+
 # Local
-from ..materials import IsotropicElasticity3D, \
-    IsotropicElasticityPlaneStrain
+from ..materials import IsotropicElasticity3D, IsotropicElasticityPlaneStrain
+
 #
 #                                                          Authorship & Credits
 # =============================================================================
@@ -542,9 +544,9 @@ function
             *batch_shape, 6, 6,
             device=tensor4.device, dtype=tensor4.dtype)
         for p, (i, j) in enumerate(idx_pairs):
-            for qidx, (k, l) in enumerate(idx_pairs):
+            for qidx, (k, m) in enumerate(idx_pairs):
                 kelvin_matrix[..., p, qidx] = (
-                    factors[p]*factors[qidx]*tensor4[..., i, j, k, l])
+                    factors[p]*factors[qidx]*tensor4[..., i, j, k, m])
         return kelvin_matrix
     # -------------------------------------------------------------------------
     @staticmethod
@@ -577,14 +579,14 @@ function
             device=kelvin_matrix.device,
             dtype=kelvin_matrix.dtype)
         for p, (i, j) in enumerate(idx_pairs):
-            for qidx, (k, l) in enumerate(idx_pairs):
+            for qidx, (k, m) in enumerate(idx_pairs):
                 val = (
                     kelvin_matrix[..., p, qidx]
                     / (factors[p]*factors[qidx]))
-                tensor4[..., i, j, k, l] = val
-                tensor4[..., j, i, k, l] = val
-                tensor4[..., i, j, l, k] = val
-                tensor4[..., j, i, l, k] = val
+                tensor4[..., i, j, k, m] = val
+                tensor4[..., j, i, k, m] = val
+                tensor4[..., i, j, m, k] = val
+                tensor4[..., j, i, m, k] = val
         return tensor4
     # -------------------------------------------------------------------------
     @staticmethod

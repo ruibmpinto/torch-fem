@@ -46,7 +46,7 @@ class Solid(FEM):
         if torch.any(detJ <= 0.0):
             raise Exception("Negative Jacobian. Check element numbering.")
         B = torch.einsum("jkl,lm->jkm", torch.linalg.inv(J), b)
-        
+
         return self.etype.N(xi), B, detJ
 
     def compute_k(self, detJ: Tensor, BCB: Tensor) -> Tensor:
@@ -93,7 +93,8 @@ class Solid(FEM):
             threshold_condition (torch.Tensor, optional):
                 Threshold condition to recover subshape. Defaults to None.
             **kwargs:
-                Additional keyword arguments passed to pyvista.Plotter.add_mesh.
+                Additional keyword arguments passed to
+                pyvista.Plotter.add_mesh.
         """
 
         pyvista.set_plot_theme("document")
@@ -111,8 +112,12 @@ class Solid(FEM):
             cell_types = self.n_elem * [pyvista.CellType.QUADRATIC_HEXAHEDRON]
 
         # VTK element list
-        el = len(self.elements[0]) * torch.ones(self.n_elem, dtype=self.elements.dtype)
-        elements = torch.cat([el[:, None], self.elements], dim=1).view(-1).tolist()
+        el = len(self.elements[0]) * torch.ones(
+            self.n_elem, dtype=self.elements.dtype
+        )
+        elements = (
+            torch.cat([el[:, None], self.elements], dim=1).view(-1).tolist()
+        )
 
         # Deformed node positions
         pos = self.nodes + u
@@ -156,7 +161,8 @@ class Solid(FEM):
             pl.add_mesh(mesh.contour(values, scalars=scalars), **kwargs)
         else:
             if show_edges:
-                if isinstance(self.etype, Tetra2) or isinstance(self.etype, Hexa2):
+                if (isinstance(self.etype, Tetra2)
+                        or isinstance(self.etype, Hexa2)):
                     # Trick to plot edges for quadratic elements
                     # See: https://github.com/pyvista/pyvista/discussions/5777
                     surface = mesh.separate_cells().extract_surface(
@@ -164,7 +170,9 @@ class Solid(FEM):
                     )
                     edges = surface.extract_feature_edges()
                     pl.add_mesh(surface, **kwargs)
-                    actor = pl.add_mesh(edges, style="wireframe", color="black")
+                    actor = pl.add_mesh(
+                        edges, style="wireframe", color="black"
+                    )
                     actor.mapper.SetResolveCoincidentTopologyToPolygonOffset()
                 else:
                     pl.add_mesh(mesh, show_edges=True, **kwargs)

@@ -1,8 +1,9 @@
 """Shell formulation
 
 The Shell element formulation is based on:
-Krysl, Petr, Robust flat-facet triangular shell finite element, International Journal
-for Numerical Methods in Engineering, vol. 123, issue 10, pp. 2399-2423, 2022
+Krysl, Petr, Robust flat-facet triangular shell finite element,
+International Journal for Numerical Methods in Engineering,
+vol. 123, issue 10, pp. 2399-2423, 2022
 https://doi.org/10.1002/nme.6944
 """
 
@@ -46,7 +47,9 @@ class Shell:
 
         # Compute mapping from local to global indices (hard to read, but fast)
         N = self.n_elem
-        idx = ((NDOF * self.elements).unsqueeze(-1) + torch.arange(NDOF)).reshape(N, -1)
+        idx = (
+            (NDOF * self.elements).unsqueeze(-1) + torch.arange(NDOF)
+        ).reshape(N, -1)
         self.indices = torch.stack(
             [
                 idx.unsqueeze(-1).expand(N, -1, idx.shape[1]),
@@ -59,7 +62,8 @@ class Shell:
         """Aggregate strain-displacement matrices
 
         Args:
-            B (torch tensor): Derivative of element shape functions (shape: [N x 2 x 3])
+            B (torch tensor): Derivative of element shape functions
+                (shape: [N x 2 x 3])
 
         Returns:
             torch tensor: Strain-displacement matrices shaped [N x 3 x 18]
@@ -68,14 +72,17 @@ class Shell:
         z = torch.zeros(N, self.etype.nodes)
         D0 = torch.stack([B[:, 0, :], z, z, z, z, z], dim=-1).reshape(N, -1)
         D1 = torch.stack([z, B[:, 1, :], z, z, z, z], dim=-1).reshape(N, -1)
-        D2 = torch.stack([B[:, 1, :], B[:, 0, :], z, z, z, z], dim=-1).reshape(N, -1)
+        D2 = torch.stack(
+            [B[:, 1, :], B[:, 0, :], z, z, z, z], dim=-1
+        ).reshape(N, -1)
         return torch.stack([D0, D1, D2], dim=1)
 
     def _Db(self, B):
         """Aggregate curvature-displacement matrices
 
         Args:
-            B (torch tensor): Derivative of element shape functions (shape: [N x 2 x 3])
+            B (torch tensor): Derivative of element shape functions
+                (shape: [N x 2 x 3])
 
         Returns:
             torch tensor: Curvature-displacement matrices shaped [N x 3 x 18]
@@ -84,7 +91,9 @@ class Shell:
         z = torch.zeros(N, self.etype.nodes)
         D0 = torch.stack([z, z, z, z, B[:, 0, :], z], dim=-1).reshape(N, -1)
         D1 = torch.stack([z, z, z, -B[:, 1, :], z, z], dim=-1).reshape(N, -1)
-        D2 = torch.stack([z, z, z, -B[:, 0, :], B[:, 1, :], z], dim=-1).reshape(N, -1)
+        D2 = torch.stack(
+            [z, z, z, -B[:, 0, :], B[:, 1, :], z], dim=-1
+        ).reshape(N, -1)
         return torch.stack([D0, D1, D2], dim=1)
 
     def _Ds(self, A):
@@ -113,15 +122,23 @@ class Shell:
             ) / (2.0 * A[:, None, None])
             D1 = torch.stack(
                 [
-                    torch.stack([z, z, d, -b * d / 2.0, a * d / 2.0, z], dim=-1),
-                    torch.stack([z, z, -c, b * c / 2.0, -a * c / 2.0, z], dim=-1),
+                    torch.stack(
+                        [z, z, d, -b * d / 2.0, a * d / 2.0, z], dim=-1
+                    ),
+                    torch.stack(
+                        [z, z, -c, b * c / 2.0, -a * c / 2.0, z], dim=-1
+                    ),
                 ],
                 dim=1,
             ) / (2.0 * A[:, None, None])
             D2 = torch.stack(
                 [
-                    torch.stack([z, z, -b, b * d / 2.0, -b * c / 2.0, z], dim=-1),
-                    torch.stack([z, z, a, -a * d / 2.0, a * c / 2.0, z], dim=-1),
+                    torch.stack(
+                        [z, z, -b, b * d / 2.0, -b * c / 2.0, z], dim=-1
+                    ),
+                    torch.stack(
+                        [z, z, a, -a * d / 2.0, a * c / 2.0, z], dim=-1
+                    ),
                 ],
                 dim=1,
             ) / (2.0 * A[:, None, None])
@@ -148,7 +165,8 @@ class Shell:
             dir2 = dir2 / torch.linalg.norm(dir2)
             local_coords.append(torch.vstack([dir1, dir2, normal]))
 
-        # Tranformation matrix x = t X with element coords x and global coords X
+        # Transformation matrix x = t X,
+        # element coords x, global coords X
         self.t = torch.stack(local_coords)
         self.T = torch.func.vmap(torch.block_diag)(*(NDOF * [self.t]))
 
@@ -159,8 +177,10 @@ class Shell:
 
     def k(self):
         # Perform integrations
-        k = torch.zeros((self.n_elem, NDOF * self.etype.nodes, NDOF * self.etype.nodes))
-        for w, q in zip(self.etype.iweights(), self.etype.ipoints()):
+        n = NDOF * self.etype.nodes
+        k = torch.zeros((self.n_elem, n, n))
+        for w, q in zip(self.etype.iweights(), self.etype.ipoints(),
+                        strict=False):
             # Jacobian
             J = self.etype.B(q) @ self.loc_nodes
             detJ = torch.linalg.det(J)
@@ -183,15 +203,26 @@ class Shell:
             # Element bending stiffness
             Db = self._Db(B)
             DbCDb = torch.einsum("...ji,...jk,...kl->...il", Db, C, Db)
-            kb = torch.einsum("i,ijk->ijk", w * self.thickness**3 * detJ / 12.0, DbCDb)
+            kb = torch.einsum(
+                "i,ijk->ijk",
+                w * self.thickness**3 * detJ / 12.0,
+                DbCDb,
+            )
 
             # Element transverse stiffness
             Ds = self._Ds(A)
             h = sqrt(2) * A
             alpha = KAPPA / (2 * (1 + NU))
-            psi = KAPPA * self.thickness**2 / (self.thickness**2 + alpha * h**2)
+            psi = (
+                KAPPA * self.thickness**2
+                / (self.thickness**2 + alpha * h**2)
+            )
             DsCsDs = torch.einsum("...ji,...jk,...kl->...il", Ds, Cs, Ds)
-            ks = torch.einsum("i,ijk->ijk", w * A * psi * self.thickness * detJ, DsCsDs)
+            ks = torch.einsum(
+                "i,ijk->ijk",
+                w * A * psi * self.thickness * detJ,
+                DsCsDs,
+            )
 
             # Element drilling stiffness
             kd = torch.zeros_like(km)
@@ -218,8 +249,13 @@ class Shell:
 
         # Get reduced stiffness matrix
         con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
-        uncon = torch.nonzero(~self.constraints.ravel(), as_tuple=False).ravel()
-        f_d = sparse_index_select(K, [None, con]) @ self.displacements.ravel()[con]
+        uncon = torch.nonzero(
+            ~self.constraints.ravel(), as_tuple=False
+        ).ravel()
+        f_d = (
+            sparse_index_select(K, [None, con])
+            @ self.displacements.ravel()[con]
+        )
         K_red = sparse_index_select(K, [uncon, uncon])
         f_red = (self.forces.ravel() - f_d)[uncon]
 
@@ -235,7 +271,9 @@ class Shell:
         f = f.reshape((-1, NDOF))
         return u, f
 
-    def compute_stress(self, u, xi=[0.0, 0.0], z=0, mises=False):
+    def compute_stress(self, u, xi=None, z=0, mises=False):
+        if xi is None:
+            xi = [0.0, 0.0]
         # Extract displacement degrees of freedom
         disp = u[self.elements, :].reshape(self.n_elem, -1)
 
@@ -253,8 +291,12 @@ class Shell:
 
         # Compute in-plane stresses in local coordinate system
         loc_disp = torch.einsum("...ij,...j->...i", self.T, disp)
-        sigma_m = torch.einsum("...ij,...jk,...k->...i", C, self._Dm(B), loc_disp)
-        sigma_b = torch.einsum("...ij,...jk,...k->...i", C, self._Db(B), loc_disp)
+        sigma_m = torch.einsum(
+            "...ij,...jk,...k->...i", C, self._Dm(B), loc_disp
+        )
+        sigma_b = torch.einsum(
+            "...ij,...jk,...k->...i", C, self._Db(B), loc_disp
+        )
         sigma = sigma_m + z * sigma_b
 
         # Compute transverse shear stresses in local coordinate system
@@ -262,7 +304,9 @@ class Shell:
         alpha = KAPPA / (2 * (1 + NU))
         psi = KAPPA * self.thickness**2 / (self.thickness**2 + alpha * h**2)
         Cs = torch.einsum("...,...jk->...jk", psi, Cs)
-        sigma_s = torch.einsum("...ij,...jk,...k->...i", Cs, self._Ds(A), loc_disp)
+        sigma_s = torch.einsum(
+            "...ij,...jk,...k->...i", Cs, self._Ds(A), loc_disp
+        )
 
         # Assemble stress tensor
         stress_tensor = torch.zeros((self.n_elem, 3, 3))
@@ -296,13 +340,15 @@ class Shell:
         node_property=None,
         element_property=None,
         thickness=False,
-        mirror=[False, False, False],
+        mirror=None,
     ):
+        if mirror is None:
+            mirror = [False, False, False]
         try:
             import numpy as np
             import pyvista
-        except ImportError:
-            raise Exception("Plotting 3D requires pyvista.")
+        except ImportError as err:
+            raise Exception('Plotting 3D requires pyvista.') from err
 
         pyvista.set_plot_theme("document")
         pyvista.set_jupyter_backend("client")
@@ -332,8 +378,8 @@ class Shell:
 
         # Plot as seperate top and bottom surface
         if thickness:
-            nodal_thickness = np.zeros((len(self.nodes)))
-            count = np.zeros((len(self.nodes)))
+            nodal_thickness = np.zeros(len(self.nodes))
+            count = np.zeros(len(self.nodes))
             for i, face in enumerate(mesh.faces.reshape(-1, 4)):
                 idx = face[1::]
                 nodal_thickness[idx] += self.thickness[i].item()
@@ -343,7 +389,9 @@ class Shell:
             top = mesh.copy()
             top.points += 0.5 * nodal_thickness[:, None] * mesh.point_normals
             bottom = mesh.copy()
-            bottom.points -= 0.5 * nodal_thickness[:, None] * mesh.point_normals
+            bottom.points -= (
+                0.5 * nodal_thickness[:, None] * mesh.point_normals
+            )
 
             pl.add_mesh(top, show_edges=True)
             pl.add_mesh(bottom, show_edges=True)
@@ -352,13 +400,19 @@ class Shell:
 
         if mirror[0]:
             for msh in pl.meshes:
-                pl.add_mesh(msh.reflect((1, 0, 0)), show_edges=True, opacity=0.5)
+                pl.add_mesh(
+                    msh.reflect((1, 0, 0)), show_edges=True, opacity=0.5
+                )
 
         if mirror[1]:
             for msh in pl.meshes:
-                pl.add_mesh(msh.reflect((0, 1, 0)), show_edges=True, opacity=0.5)
+                pl.add_mesh(
+                    msh.reflect((0, 1, 0)), show_edges=True, opacity=0.5
+                )
 
         if mirror[2]:
             for msh in pl.meshes:
-                pl.add_mesh(msh.reflect((0, 0, 1)), show_edges=True, opacity=0.5)
+                pl.add_mesh(
+                    msh.reflect((0, 0, 1)), show_edges=True, opacity=0.5
+                )
         pl.show(jupyter_backend="html")

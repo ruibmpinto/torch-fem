@@ -6,7 +6,8 @@ implementations for different PDE types (mechanics, diffusion, etc.).
 """
 
 from abc import ABC, abstractmethod
-from typing import Callable
+from collections.abc import Callable
+
 import torch
 from torch import Tensor
 
@@ -574,7 +575,6 @@ class NonlinearDiffusionOperator(Operator):
         # Extract phi from state
         phi = state[..., 0]
         k = self.k_fn(phi)
-        dk = self.dk_fn(phi)
 
         grad_phi = torch.diagonal(gradient_inc, dim1=-2, dim2=-1)
         flux_new = -k[..., None] * grad_phi

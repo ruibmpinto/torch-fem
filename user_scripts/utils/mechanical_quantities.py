@@ -1,10 +1,7 @@
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 
-import numpy as np
-import matplotlib.pyplot as plt
-import torch
 
 # =============================================================================
 def interpolate_displacement_field(
@@ -174,10 +171,12 @@ def compute_strain_energy_density(
                              'elastoplastic_lh',
                              'lou_zhang_yoon']:
         # Compute strain tensor from deformation gradient
-        # Small strain: epsilon = 0.5 * (F + F^T) - I
-        I = torch.eye(dim, device=def_grad.device, dtype=def_grad.dtype)
-        I = I.expand_as(def_grad)
-        epsilon = 0.5 * (def_grad + def_grad.transpose(-2, -1)) - I
+        # Small strain: epsilon = 0.5 * (F + F^T) - identity
+        identity = torch.eye(
+            dim, device=def_grad.device, dtype=def_grad.dtype)
+        identity = identity.expand_as(def_grad)
+        epsilon = (0.5 * (def_grad + def_grad.transpose(-2, -1))
+                   - identity)
 
         # Strain energy density: W = 0.5 * sigma : epsilon
         # Using Einstein summation for tensor contraction

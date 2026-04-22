@@ -10,17 +10,20 @@ Boundary conditions:
 Analytical solution: φ(x,y) = x
 """
 
-import sys
 import os
+import sys
+
 # Add local src to path to use modified code
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..', 'src'))
 
-import torch
 import matplotlib.pyplot as plt
 import numpy as np
-from torchfem.planar import Planar
-from torchfem.operators import DiffusionOperator
+import torch
+
 from torchfem.mesh import rect_quad
+from torchfem.operators import DiffusionOperator
+from torchfem.planar import Planar
+
 
 def create_mesh(nx: int, ny: int, lx: float = 1.0, ly: float = 1.0):
     """
@@ -141,7 +144,8 @@ def compute_h1_error(fem, u, analytical_sol, analytical_grad):
         phi_elem = phi_h[elem_nodes]
 
         # Integrate over element
-        for w, xi in zip(etype.iweights(), etype.ipoints()):
+        for w, xi in zip(etype.iweights(), etype.ipoints(),
+                         strict=False):
             # Shape functions and derivatives
             N = etype.N(xi)
             dN_dxi = etype.B(xi)
@@ -200,7 +204,7 @@ def main():
 
     # Initialize FEM problem
     fem = Planar(nodes, elements, operator)
-    print(f"FEM problem initialized (Planar with Quad elements)")
+    print("FEM problem initialized (Planar with Quad elements)")
 
     # Apply Dirichlet BCs: φ=0 on all boundaries
     boundaries = identify_boundary_nodes(nodes)
@@ -210,7 +214,7 @@ def main():
     ])
     all_boundary = np.unique(all_boundary)
 
-    print(f"\nApplying boundary conditions:")
+    print("\nApplying boundary conditions:")
     print(f"  All boundaries: φ = 0 ({len(all_boundary)} nodes)")
 
     # Set constraints (scalar field: 1 DOF per node)
@@ -236,10 +240,10 @@ def main():
         f_source * nodal_area, dtype=torch.float32
     ).reshape(-1, 1)
     fem.forces = forces
-    print(f"  Source: f = 2π²sin(πx)sin(πy)")
+    print("  Source: f = 2π²sin(πx)sin(πy)")
 
     # Solve using direct forward solver for linear problem
-    print(f"\nSolving Poisson equation...")
+    print("\nSolving Poisson equation...")
     u, f_out = fem.solve_forward(
         verbose=True,
         method='spsolve'
@@ -260,14 +264,14 @@ def main():
         fem, u, analytical_solution, analytical_gradient
     )
 
-    print(f"\nError analysis:")
+    print("\nError analysis:")
     print(f"  Max error: {max_error:.6e}")
     print(f"  Mean error: {mean_error:.6e}")
     print(f"  L2 error: {l2_error:.6e}")
     print(f"  H1 seminorm error: {h1_error:.6e}")
 
     # Visualization
-    print(f"\nGenerating plots...")
+    print("\nGenerating plots...")
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     # Numerical solution
@@ -299,10 +303,10 @@ def main():
 
     plt.tight_layout()
     plt.savefig('poisson_2d_solution.png', dpi=150)
-    print(f"Plot saved to: poisson_2d_solution.png")
+    print("Plot saved to: poisson_2d_solution.png")
 
     # Convergence study
-    print(f"\n" + "="*60)
+    print("\n" + "="*60)
     print("Convergence Study")
     print("="*60)
     mesh_sizes = [5, 10, 20, 40, 80, 160]
@@ -387,7 +391,7 @@ def main():
 
     plt.tight_layout()
     plt.savefig('laplace_2d_convergence.png', dpi=150)
-    print(f"\nConvergence plot saved to: laplace_2d_convergence.png")
+    print("\nConvergence plot saved to: laplace_2d_convergence.png")
 
     print("\n" + "="*60)
     print("Simulation complete!")

@@ -1,5 +1,4 @@
 from os import PathLike
-from typing import Dict
 
 import torch
 from meshio import Mesh
@@ -16,8 +15,8 @@ from .materials import Material
 def export_mesh(
     mesh: FEM,
     filename: PathLike,
-    nodal_data: Dict[str, Tensor] = {},
-    elem_data: Dict[str, Tensor] = {},
+    nodal_data: dict[str, Tensor] = None,
+    elem_data: dict[str, Tensor] = None,
 ):
     if isinstance(mesh, Truss):
         etype = "line"
@@ -39,10 +38,17 @@ def export_mesh(
         elif isinstance(mesh.etype, Hexa2):
             etype = "hexahedron20"
 
+    if nodal_data is None:
+        nodal_data = {}
+    if elem_data is None:
+        elem_data = {}
     msh = Mesh(
         points=mesh.nodes.cpu().detach(),
         cells={etype: mesh.elements.cpu().detach()},
-        point_data={key: tensor.cpu().detach() for key, tensor in nodal_data.items()},
+        point_data={
+            key: tensor.cpu().detach()
+            for key, tensor in nodal_data.items()
+        },
         cell_data={
             key: [tensor.cpu().detach() for tensor in tensor_list]
             for key, tensor_list in elem_data.items()
@@ -85,5 +91,7 @@ def import_mesh(filename: PathLike, material: Material):
         elif etype in ["tetra", "tetra10", "hexahedron", "hexahedron20"]:
             return Solid(nodes, elements, material)
     else:
-        nodes = torch.from_numpy(mesh.points.astype(np.float32)[:, 0:2]).type(dtype)
+        nodes = torch.from_numpy(
+            mesh.points.astype(np.float32)[:, 0:2]
+        ).type(dtype)
         return Planar(nodes, elements, material)

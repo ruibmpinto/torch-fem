@@ -1,43 +1,79 @@
 [build-system]
-requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+requires = ["setuptools>=43.0.0", "wheel"]
 
 [project]
 name = "torch-fem"
 version = "0.4.5"
-authors = [{ name = "Nils Meyer", email = "nils.meyer@uni-a.de" }]
-description = "GPU accelerated differential finite elements for solid mechanics with PyTorch."
+description = "GPU accelerated differentiable finite elements for solid mechanics with PyTorch."
 readme = "README.md"
 license = {file = "LICENSE"}
-keywords = ["finite elements", "automatic differentiation"]
+keywords = ["finite elements", "automatic differentiation", "pytorch", "solid mechanics"]
 requires-python = ">=3.10"
+authors = [
+  {email = "nils.meyer@uni-a.de", name = "Nils Meyer"},
+]
+maintainers = [
+  {email = "rui_pinto@brown.edu", name = "Rui Barreira Morais Pinto"},
+]
 classifiers = [
-    'Programming Language :: Python',
-    'Programming Language :: Python :: 3',
-    'Programming Language :: Python :: 3.10',
-    'Programming Language :: Python :: 3.11',
-    'Programming Language :: Python :: 3.12',
-    'Programming Language :: Python :: 3.13',
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "ipywidgets",
-    "ipykernel",
-    "matplotlib",
-    "memory_profiler",
-    "meshio",
-    "meshzoo",
-    "pyamg",
-    "pyvista",
-    "scipy~=1.15.0",
-    "tqdm",
-    "torch",
-    "trame",
-    "trame-vuetify",
-    "trame-vtk",
+  "ipywidgets",
+  "ipykernel",
+  "matplotlib",
+  "memory_profiler",
+  "meshio",
+  "meshzoo",
+  "pyamg",
+  "pyvista",
+  "scipy~=1.15.0",
+  "tqdm",
+  "torch",
+  "trame",
+  "trame-vuetify",
+  "trame-vtk",
+]
+
+[project.optional-dependencies]
+dev = [
+  "setuptools>=43.0.0",
+  "build",
+  "wheel",
+  "pre-commit>=4.4.0",
+  "ruff>=0.14.10",
+]
+docs = [
+  "mkdocs>=1.6.0",
+  "mkdocs-gen-files>=0.5.0",
+  "mkdocs-include-exclude-files>=0.1.0",
+  "mkdocs-ipynb>=0.1.1",
+  "mkdocs-material>=9.6.20",
+  "mkdocstrings>=0.30.1",
+  "mkdocstrings-python>=1.18.2",
+  "pymdown-extensions>=10.16.1",
+]
+tests = [
+  "pytest>=8.4.1",
+  "pytest-cov>=6.2.1",
 ]
 
 [project.urls]
-source = "https://github.com/meyer-nils/torch-fem"
+homepage = "https://github.com/ruibmpinto/torch-fem"
+bugs = "https://github.com/ruibmpinto/torch-fem/issues"
+documentation = "https://ruibmpinto.github.io/torch-fem/"
+source = "https://github.com/ruibmpinto/torch-fem"
 
 [tool.setuptools]
 include-package-data = true
@@ -47,3 +83,46 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 torchfem = ["data/*.*"]
+
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint]
+exclude = [
+  "__pycache__",
+  "build",
+  "dist",
+  "*.egg",
+  "*.egg-info",
+  "*.ipynb",
+  "tests",
+  ".git",
+  "node_modules",
+]
+ignore = [
+  "B008",
+  "B023",
+  "E226",
+  "E3",
+  "E731",
+  "C901",
+  "UP045",
+  "B027",
+  "B012",
+  "F401",
+]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # Pyflakes
+  "I",   # isort
+  "B",   # flake8-bugbear
+  "UP",  # pyupgrade
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "E402"]
+"user_scripts/**/*.py" = ["E402", "F841"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"

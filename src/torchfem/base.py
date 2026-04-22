@@ -1,43 +1,42 @@
+import copy
+import cProfile
+import functools
+import os
+import pstats
 from abc import ABC, abstractmethod
-from typing import Literal, Tuple
+from typing import Literal
+
 import numpy as np
 import torch
 from torch import Tensor
-import copy
-import cProfile
-import pstats
 
-from .elements import Element, Quad1, Quad2, Hexa1, Hexa2
+from .elements import Element, Hexa1, Hexa2, Quad1, Quad2
 from .materials import Material
 from .sparse import CachedSolve, sparse_solve
-
-import os
-import functools
 
 is_import_graphorge = (
     os.environ.get('TORCHFEM_IMPORT_GRAPHORGE', '0') == '1')
 
 if is_import_graphorge:
-    import torch_geometric.data as pyg_data
-    from graphorge.gnn_base_model.model.gnn_model \
-        import GNNEPDBaseModel
-    from graphorge.gnn_base_model.data.graph_data \
-        import GraphData
-    from graphorge.projects.material_patches \
-        .gnn_model_tools.gen_graphs_files \
-        import (get_elem_size_dims,
-                get_mesh_connected_nodes)
-    from graphorge.projects.material_patches \
-        .gnn_model_tools.features import (
-            GNNPatchFeaturesGenerator)
-    from graphorge.gnn_base_model.model.custom_layers \
-        import (compute_stiffness_matrix,
-                extract_forces,
-                extract_displacements,
-                compute_edge_features,
-                reconstruct_graph_with_displacements,
-                remove_rigid_body_motion)
     import torch.func as torch_func
+    import torch_geometric.data as pyg_data
+    from graphorge.gnn_base_model.data.graph_data import GraphData
+    from graphorge.gnn_base_model.model.custom_layers import (
+        compute_edge_features,
+        compute_stiffness_matrix,
+        extract_displacements,
+        extract_forces,
+        reconstruct_graph_with_displacements,
+        remove_rigid_body_motion,
+    )
+    from graphorge.gnn_base_model.model.gnn_model import GNNEPDBaseModel
+    from graphorge.projects.material_patches \
+            .gnn_model_tools.features import GNNPatchFeaturesGenerator
+    from graphorge.projects.material_patches \
+            .gnn_model_tools.gen_graphs_files import (
+        get_elem_size_dims,
+        get_mesh_connected_nodes,
+    )
 
 
 class FEM(ABC):
@@ -138,7 +137,9 @@ class FEM(ABC):
             TypeError: If not floating-point type.
         """
         if not value.shape == self.nodes.shape:
-            raise ValueError("Displacements must have the same shape as nodes.")
+            raise ValueError(
+                "Displacements must have the same shape as nodes."
+            )
         if not torch.is_floating_point(value):
             raise TypeError("Displacements must be a floating-point tensor.")
         self._displacements = value.to(self.nodes.device)
@@ -247,18 +248,18 @@ class FEM(ABC):
     # -------------------------------------------------------------------------
     def k0(self) -> Tensor:
         """Compute element stiffness matrix for zero strain.
-        
+
         Returns:
-            Tensor: Element stiffness matrices of shape (n_elem, n_dof_elem, 
+            Tensor: Element stiffness matrices of shape (n_elem, n_dof_elem,
                 n_dof_elem).
         """
         u = torch.zeros_like(self.nodes)
-        F = torch.zeros(2, self.n_int, self.n_elem, self.n_stress, 
+        F = torch.zeros(2, self.n_int, self.n_elem, self.n_stress,
                         self.n_stress)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         F[:, :, :, :, :] = torch.eye(self.n_stress)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        s = torch.zeros(2, self.n_int, self.n_elem, self.n_stress, 
+        s = torch.zeros(2, self.n_int, self.n_elem, self.n_stress,
                         self.n_stress)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         a = torch.zeros(2, self.n_int, self.n_elem, self.material.n_state)
@@ -280,26 +281,26 @@ class FEM(ABC):
         du: Tensor,
         de0: Tensor,
         nlgeom: bool,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Perform numerical integrations for element stiffness matrix.
-        
+
         Args:
-            u (Tensor): Displacement history of shape (n_increments, n_nodes, 
+            u (Tensor): Displacement history of shape (n_increments, n_nodes,
                 n_dim).
-            F (Tensor): Deformation gradient history of shape (n_increments, 
+            F (Tensor): Deformation gradient history of shape (n_increments,
                 n_int, n_elem, n_stress, n_stress).
-            stress (Tensor): Stress history of shape (n_increments, n_int, 
+            stress (Tensor): Stress history of shape (n_increments, n_int,
                 n_elem, n_stress, n_stress).
-            state (Tensor): Material state variable history of shape 
+            state (Tensor): Material state variable history of shape
                 (n_increments, n_int, n_elem, n_state).
             n (int): Current increment number.
             du (Tensor): Displacement increment vector of shape (n_dofs,).
-            de0 (Tensor): External strain increment of shape (n_elem, 
+            de0 (Tensor): External strain increment of shape (n_elem,
                 n_stress, n_stress).
             nlgeom (bool): Whether to use nonlinear geometry.
-            
+
         Returns:
-            Tuple[Tensor, Tensor]: Element stiffness matrices of shape 
+            Tuple[Tensor, Tensor]: Element stiffness matrices of shape
                 (n_elem, n_dof_elem, n_dof_elem) and internal force vectors
                 of shape (n_elem, n_dof_elem).
         """
@@ -315,8 +316,9 @@ class FEM(ABC):
         f = torch.zeros(self.n_elem, self.n_dim * n_nod)
         k = torch.zeros((self.n_elem, self.n_dim * n_nod, self.n_dim * n_nod))
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        for i, (w, xi) in enumerate(zip(self.etype.iweights(), 
-                                        self.etype.ipoints())):
+        for i, (w, xi) in enumerate(zip(self.etype.iweights(),
+                                        self.etype.ipoints(),
+                                        strict=False)):
             # Compute gradient operators
             _, B0, detJ0 = self.eval_shape_functions(xi)
             if nlgeom:
@@ -458,22 +460,22 @@ class FEM(ABC):
     def _load_Graphorge_model(self, model_directory: str,
                               device_type: str = 'cpu'):
         """Load and configure Graphorge material patch model.
-        
+
         Args:
-            model_directory (str): Path to the directory containing the trained 
+            model_directory (str): Path to the directory containing the trained
                 Graphorge model files.
-            device_type (str, optional): Device type for model execution 
+            device_type (str, optional): Device type for model execution
                 ('cpu' or 'cuda'). Defaults to 'cpu'.
-                
+
         Returns:
-            GNNEPDBaseModel: Loaded and configured Graphorge model ready for 
+            GNNEPDBaseModel: Loaded and configured Graphorge model ready for
                 inference with material patch predictions.
-                
+
         Example:
             >>> model = fem_instance._load_Graphorge_model(
             ...     model_directory='/path/to/trained/model',
             ...     device_type='cpu')
-        """     
+        """
         # Initialize model from directory
         model = GNNEPDBaseModel.init_model_from_file(model_directory)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -493,15 +495,15 @@ class FEM(ABC):
         # model._is_force_equilibrium = False
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return model
-    # -------------------------------------------------------------------------  
+    # -------------------------------------------------------------------------
     def integrate_field(self, field: Tensor | None = None) -> Tensor:
         """Integrate scalar field over elements.
-        
+
         Args:
-            field (Tensor, optional): Scalar field values at nodes of shape 
-                (n_nodes,). If None, integrates unity to compute volumes. 
+            field (Tensor, optional): Scalar field values at nodes of shape
+                (n_nodes,). If None, integrates unity to compute volumes.
                 Defaults to None.
-                
+
         Returns:
             Tensor: Integrated values for each element of shape (n_elem,).
                 If field is None, returns element volumes.
@@ -512,7 +514,8 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Integrate
         res = torch.zeros(len(self.elements))
-        for w, xi in zip(self.etype.iweights(), self.etype.ipoints()):
+        for w, xi in zip(self.etype.iweights(), self.etype.ipoints(),
+                         strict=False):
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Evalute shale functions
             N, B, detJ = self.eval_shape_functions(xi)
@@ -524,13 +527,13 @@ class FEM(ABC):
     def assemble_stiffness(self, k: Tensor, con: Tensor) -> Tensor:
         """Assemble global stiffness matrix from element contributions.
         Args:
-            k (Tensor): Element stiffness matrices of shape 
+            k (Tensor): Element stiffness matrices of shape
                 (n_elem, n_dof_elem, n_dof_elem).
             con (Tensor): Global DOF indices of constrained degrees of freedom
                 of shape (n_constraints,).
-                
+
         Returns:
-            Tensor: Assembled sparse global stiffness matrix of shape 
+            Tensor: Assembled sparse global stiffness matrix of shape
                 (n_dofs, n_dofs) in COO format.
         """
         # Initialize sparse matrix
@@ -539,23 +542,23 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Build matrix in chunks to prevent excessive memory usage
         chunks = 4
-        for idx, k_chunk in zip(torch.chunk(self.idx, chunks), 
-                                torch.chunk(k, chunks)):
+        for idx, k_chunk in zip(torch.chunk(self.idx, chunks),
+                                torch.chunk(k, chunks), strict=False):
             # Ravel indices and values
             chunk_size = idx.shape[0]
-            col = idx.unsqueeze(1).expand(chunk_size, self.idx.shape[1], 
+            col = idx.unsqueeze(1).expand(chunk_size, self.idx.shape[1],
                                           -1).ravel()
-            row = idx.unsqueeze(-1).expand(chunk_size, -1, 
+            row = idx.unsqueeze(-1).expand(chunk_size, -1,
                                            self.idx.shape[1]).ravel()
             indices = torch.stack([row, col], dim=0)
             values = k_chunk.ravel()
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Eliminate and replace constrained dofs
             ci = torch.isin(idx, con)
-            mask_col = ci.unsqueeze(1).expand(chunk_size, self.idx.shape[1], 
+            mask_col = ci.unsqueeze(1).expand(chunk_size, self.idx.shape[1],
                                               -1).ravel()
             mask_row = (
-                ci.unsqueeze(-1).expand(chunk_size, -1, 
+                ci.unsqueeze(-1).expand(chunk_size, -1,
                                         self.idx.shape[1]).ravel()
             )
             mask = ~(mask_col | mask_row)
@@ -573,16 +576,16 @@ class FEM(ABC):
     # -------------------------------------------------------------------------
     def assemble_force(self, f: Tensor) -> Tensor:
         """Assemble global force vector from element contributions.
-        
+
         Args:
             f (Tensor): Element force vectors of shape (n_elem, n_dof_elem).
-            
+
         Returns:
             Tensor: Assembled global force vector of shape (n_dofs,).
         """
 
         # Initialize force vector
-        F = torch.zeros((self.n_dofs))
+        F = torch.zeros(self.n_dofs)
 
         # Ravel indices and values
         indices = self.idx.ravel()
@@ -651,9 +654,9 @@ class FEM(ABC):
         nlgeom: bool = False,
         return_volumes: bool = False,
         return_resnorm: bool = False,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
-        Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
-        Tensor, Tensor, Tensor, Tensor, Tensor, dict] | Tuple[
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
+        Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
+        Tensor, Tensor, Tensor, Tensor, Tensor, dict] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict]:
         """Solve the FEM problem with the Newton-Raphson method.
 
@@ -664,29 +667,30 @@ class FEM(ABC):
             atol (float): Absolute tolerance for Newton-Raphson convergence.
             stol (float): Solver tolerance for iterative methods.
             verbose (bool): Print iteration information.
-            method (str): Method for linear solve 
+            method (str): Method for linear solve
                 ('spsolve','minres','cg','pardiso').
             device (str): Device to run the linear solve on.
             return_intermediate (bool): Return intermediate values if True.
-            aggregate_integration_points (bool): Aggregate integration 
+            aggregate_integration_points (bool): Aggregate integration
                 points if True.
-            use_cached_solve (bool): Use cached solve, e.g. in topology 
+            use_cached_solve (bool): Use cached solve, e.g. in topology
                 optimization.
             nlgeom (bool): Use nonlinear geometry if True.
-            return_volumes (bool): Return element volumes for each 
+            return_volumes (bool): Return element volumes for each
                 increment if True.
-            return_resnorm (bool): Return residual norm history for each 
+            return_resnorm (bool): Return residual norm history for each
                 increment if True.
 
         Returns:
-                Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: Final 
+                Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: Final
                     displacements,
-                    internal forces, stress, deformation gradient, and 
+                    internal forces, stress, deformation gradient, and
                     material state.
                 If return_volumes=True, also returns element volumes with shape
                 (num_increments, num_elem, 1).
-                If return_resnorm=True, also returns residual history dict with
-                increment numbers as keys and lists of residual norms as values.
+                If return_resnorm=True, also returns residual history
+                dict with increment numbers as keys and lists of
+                residual norms as values.
 
         """
         # Number of increments
@@ -737,7 +741,7 @@ class FEM(ABC):
             # Initialize residual list for this increment if requested
             if return_resnorm:
                 residual_history[n] = []
-            
+
             for i in range(max_iter):
                 du[con] = DU[con]
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -748,7 +752,9 @@ class FEM(ABC):
                     u, defgrad, stress, state, n, du, de0, nlgeom
                 )
                 # profiler.disable()
-                # print(f"\n=== integrate_material PROFILE (increment {n}) ===")
+                # print(
+                #     f"\n=== integrate_material PROFILE (increment {n}) ==="
+                # )
                 # stats = pstats.Stats(profiler)
                 # stats.sort_stats('cumulative').print_stats(10)
                 if self.K.numel() == 0 or not self.material.n_state == 0 or \
@@ -847,33 +853,33 @@ class FEM(ABC):
         nlgeom: bool,
         scaler_hydrostatic: float,
         scaler_deviatoric: float,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Perform numerical integrations using MSC surrogate model.
-        
+
         Args:
             msc_model: Loaded MSC PyTorch model.
-            u (Tensor): Displacement history of shape (n_increments, n_nodes, 
+            u (Tensor): Displacement history of shape (n_increments, n_nodes,
                 n_dim).
-            F (Tensor): Deformation gradient history of shape (n_increments, 
+            F (Tensor): Deformation gradient history of shape (n_increments,
                 n_int, n_elem, n_stress, n_stress).
-            stress (Tensor): Stress history of shape (n_increments, n_int, 
+            stress (Tensor): Stress history of shape (n_increments, n_int,
                 n_elem, n_stress, n_stress).
-            state (Tensor): Material state variable history of shape 
+            state (Tensor): Material state variable history of shape
                 (n_increments, n_int, n_elem, n_state).
             n (int): Current increment number.
             du (Tensor): Displacement increment vector of shape (n_dofs,).
-            de0 (Tensor): External strain increment of shape (n_elem, 
+            de0 (Tensor): External strain increment of shape (n_elem,
                 n_stress, n_stress).
             nlgeom (bool): Whether to use nonlinear geometry.
             scaler_hydrostatic (float): Scaling factor for hydrostatic stress.
             scaler_deviatoric (float): Scaling factor for deviatoric stress.
-            
+
         Returns:
-            Tuple[Tensor, Tensor]: Element stiffness matrices of shape 
+            Tuple[Tensor, Tensor]: Element stiffness matrices of shape
                 (n_elem, n_dof_elem, n_dof_elem) and internal force vectors
                 of shape (n_elem, n_dof_elem).
         """
-        
+
         # Compute updated configuration
         u_trial = u[n - 1] + du.view((-1, self.n_dim))
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -886,8 +892,9 @@ class FEM(ABC):
         f = torch.zeros(self.n_elem, self.n_dim * n_nod)
         k = torch.zeros((self.n_elem, self.n_dim * n_nod, self.n_dim * n_nod))
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        for i, (w, xi) in enumerate(zip(self.etype.iweights(), 
-                                        self.etype.ipoints())):
+        for i, (w, xi) in enumerate(zip(self.etype.iweights(),
+                                        self.etype.ipoints(),
+                                        strict=False)):
             # Compute gradient operators
             _, B0, detJ0 = self.eval_shape_functions(xi)
             if nlgeom:
@@ -918,14 +925,14 @@ class FEM(ABC):
                 delta_eps_msc[:, 5] = delta_eps[:, 2, 2]  # eps_33
             else:
                 delta_eps_msc[:, 2] = delta_eps[:, 1, 1]  # eps_22
-            
+
             # Reshape for MSC input (seq_len=1, features=6)
             eps_msc_input = delta_eps_msc.unsqueeze(1)
             breakpoint()
             # Extract hidden states from previous step
             # state[n-1, i] stores states per integration point
             hidden_states = state[n - 1, i]
-            
+
             # Single forward pass with gradients enabled
             sigma_pred, new_hidden_states = msc_model(
                 eps_msc_input, hidden_states)
@@ -942,19 +949,19 @@ class FEM(ABC):
             breakpoint()
             # Reorder denormalized stress to torch-fem order
             sigma_torchfem = torch.zeros(self.n_elem, 6)
-            sigma_torchfem[:, 0] = (sigma_denorm[:, 1] + 
+            sigma_torchfem[:, 0] = (sigma_denorm[:, 1] +
                                      sigma_denorm[:, 0])  # sigma_11
             sigma_torchfem[:, 1] = sigma_denorm[:, 3]  # sigma_12
             if self.n_dim == 3:
                 sigma_torchfem[:, 2] = sigma_denorm[:, 4]  # sigma_13
-                sigma_torchfem[:, 3] = (sigma_denorm[:, 2] + 
+                sigma_torchfem[:, 3] = (sigma_denorm[:, 2] +
                                          sigma_denorm[:, 0])  # sigma_22
                 sigma_torchfem[:, 4] = sigma_denorm[:, 5]  # sigma_23
-                sigma_torchfem[:, 5] = (3*sigma_denorm[:, 0] - 
-                                         sigma_torchfem[:, 0] - 
+                sigma_torchfem[:, 5] = (3*sigma_denorm[:, 0] -
+                                         sigma_torchfem[:, 0] -
                                          sigma_torchfem[:, 3])  # sigma_33
             else:
-                sigma_torchfem[:, 2] = (sigma_denorm[:, 2] + 
+                sigma_torchfem[:, 2] = (sigma_denorm[:, 2] +
                                          sigma_denorm[:, 0])  # sigma_22
             breakpoint()
             # Update stress tensor for this integration point
@@ -973,9 +980,9 @@ class FEM(ABC):
                 stress[n, i, :, 0, 1] = sigma_torchfem[:, 1]  # sigma_12
                 stress[n, i, :, 1, 0] = sigma_torchfem[:, 1]  # sigma_21
                 stress[n, i, :, 1, 1] = sigma_torchfem[:, 2]  # sigma_22
-            
+
             # Compute ddsdde via autograd as 4th-order tensor
-            # ddsdde[e,i_idx,j_idx,k,l] = 
+            # ddsdde[e,i_idx,j_idx,k,l] =
             # \partial sigma__ij/\partial \varepsilon_kl
             ddsdde = torch.zeros(self.n_elem, 3, 3, 3, 3)
             for i_idx in range(3):
@@ -1041,9 +1048,9 @@ class FEM(ABC):
         nlgeom: bool = False,
         return_volumes: bool = False,
         return_resnorm: bool = False,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
-        Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
-        Tensor, Tensor, Tensor, Tensor, Tensor, dict] | Tuple[
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
+        Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
+        Tensor, Tensor, Tensor, Tensor, Tensor, dict] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict]:
         """Solve the FEM problem using the MSC surrogate model.
 
@@ -1062,29 +1069,30 @@ class FEM(ABC):
                 convergence.
             stol (float): Solver tolerance for iterative methods.
             verbose (bool): Print iteration information.
-            method (str): Method for linear solve 
+            method (str): Method for linear solve
                 ('spsolve','minres','cg','pardiso').
             device (str): Device to run the linear solve on.
             return_intermediate (bool): Return intermediate values if True.
-            aggregate_integration_points (bool): Aggregate integration 
+            aggregate_integration_points (bool): Aggregate integration
                 points if True.
-            use_cached_solve (bool): Use cached solve, e.g. in topology 
+            use_cached_solve (bool): Use cached solve, e.g. in topology
                 optimization.
             nlgeom (bool): Use nonlinear geometry if True.
-            return_volumes (bool): Return element volumes for each 
+            return_volumes (bool): Return element volumes for each
                 increment if True.
-            return_resnorm (bool): Return residual norm history for each 
+            return_resnorm (bool): Return residual norm history for each
                 increment if True.
 
         Returns:
-                Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: Final 
+                Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: Final
                     displacements,
-                    internal forces, stress, deformation gradient, and 
+                    internal forces, stress, deformation gradient, and
                     material state.
                 If return_volumes=True, also returns element volumes with shape
                 (num_increments, num_elem, 1).
-                If return_resnorm=True, also returns residual history dict with
-                increment numbers as keys and lists of residual norms as values.
+                If return_resnorm=True, also returns residual history
+                dict with increment numbers as keys and lists of
+                residual norms as values.
 
         """
         # Number of increments
@@ -1135,7 +1143,7 @@ class FEM(ABC):
             # Initialize residual list for this increment if requested
             if return_resnorm:
                 residual_history[n] = []
-            
+
             for i in range(max_iter):
                 du[con] = DU[con]
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1264,8 +1272,6 @@ class FEM(ABC):
         else:
             n_elem_per_dim = patch_elem_per_dim
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Material patches always use Quad4 (linear) elements
-        elem_order = 1
         # Set mesh dimensions from n_elem_per_dim
         mesh_nx = n_elem_per_dim[0]
         mesh_ny = n_elem_per_dim[1]
@@ -1274,7 +1280,6 @@ class FEM(ABC):
         # Build mesh_nodes_matrix for Quad4-based patches
         # For a patch with mesh_nx x mesh_ny elements, the boundary nodes
         # form a (mesh_nx+1) x (mesh_ny+1) grid, but we only keep boundary
-        n_nod = self.etype.nodes
         if dim == 2:
             # Linear elements: (mesh_nx+1)x(mesh_ny+1) nodes
             mesh_nodes_matrix = np.zeros(
@@ -1385,7 +1390,7 @@ class FEM(ABC):
         model_cache: dict = None,
         patch_resolution: dict = None,
         is_jacfwd_parallel: bool = False,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Perform surrogate integration using Graphorge material patch model.
 
         Args:
@@ -1484,7 +1489,10 @@ class FEM(ABC):
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             def detach_hidden_states(states):
                 if isinstance(states, dict):
-                    return {k: detach_hidden_states(v) for k, v in states.items()}
+                    return {
+                        k: detach_hidden_states(v)
+                        for k, v in states.items()
+                    }
                 elif isinstance(states, list):
                     return [detach_hidden_states(item) for item in states]
                 elif torch.is_tensor(states):
@@ -1691,9 +1699,9 @@ class FEM(ABC):
         stiffness_output_dir: str | None = None,
         patch_size_label: str | None = None,
         is_jacfwd_parallel: bool = False,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
-        Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | Tuple[
-        Tensor, Tensor, Tensor, Tensor, Tensor, dict] | Tuple[
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
+        Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
+        Tensor, Tensor, Tensor, Tensor, Tensor, dict] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict]:
         """Solve the FEM problem with material patches and the surrogate model.
 
@@ -1701,7 +1709,7 @@ class FEM(ABC):
             is_mat_patch (Tensor): Element-wise flag indicating material patch
                 usage of shape (n_elem,). Values: 0 = use standard
                 integration, >0 = material patch ID for surrogate integration.
-            increments (Tensor): Load increment stepping of shape 
+            increments (Tensor): Load increment stepping of shape
                 (n_increments,). Defaults to torch.tensor([0.0, 1.0]).
             max_iter (int): Maximum number of iterations during Newton-Raphson.
                 Defaults to 100.
@@ -1709,41 +1717,42 @@ class FEM(ABC):
                 Defaults to 1e-8.
             atol (float): Absolute tolerance for Newton-Raphson convergence.
                 Defaults to 1e-6.
-            stol (float): Solver tolerance for iterative methods. 
+            stol (float): Solver tolerance for iterative methods.
                 Defaults to 1e-10.
-            verbose (bool): Whether to print iteration information. 
+            verbose (bool): Whether to print iteration information.
                 Defaults to False.
-            method (str, optional): Method for linear solve ('spsolve', 
-                'minres', 'cg', 'pardiso'). Defaults to None for automatic 
+            method (str, optional): Method for linear solve ('spsolve',
+                'minres', 'cg', 'pardiso'). Defaults to None for automatic
                 selection.
-            device (str, optional): Device to run the linear solve on. 
+            device (str, optional): Device to run the linear solve on.
                 Defaults to None.
-            return_intermediate (bool): Whether to return intermediate values. 
+            return_intermediate (bool): Whether to return intermediate values.
                 Defaults to True.
-            aggregate_integration_points (bool): Whether to aggregate 
+            aggregate_integration_points (bool): Whether to aggregate
                 integration points. Defaults to True.
-            use_cached_solve (bool): Whether to use cached solve for 
+            use_cached_solve (bool): Whether to use cached solve for
                 optimization. Defaults to False.
-            nlgeom (bool): Whether to use nonlinear geometry. 
+            nlgeom (bool): Whether to use nonlinear geometry.
                 Defaults to False.
-            return_volumes (bool): Whether to return element volumes for each 
+            return_volumes (bool): Whether to return element volumes for each
                 increment. Defaults to False.
-            is_stepwise (bool): Whether to use stepwise RNN mode for 
+            is_stepwise (bool): Whether to use stepwise RNN mode for
                 surrogate integration. Defaults to False.
-            model_directory (str, optional): Path to trained Graphorge model. 
+            model_directory (str, optional): Path to trained Graphorge model.
                 If None, uses default path. Defaults to None.
-            return_resnorm (bool): Whether to return residual norm history. 
+            return_resnorm (bool): Whether to return residual norm history.
                 Defaults to False.
 
         Returns:
-            Tuple[Tensor, ...]: If return_volumes=False and return_resnorm=False, 
-                returns 5-tuple of (displacements, forces, stress, 
-                deformation_gradient, state). If return_volumes=True, returns 
-                6-tuple with volumes added. If return_resnorm=True, returns 
+            Tuple[Tensor, ...]: If return_volumes=False and
+                return_resnorm=False,
+                returns 5-tuple of (displacements, forces, stress,
+                deformation_gradient, state). If return_volumes=True, returns
+                6-tuple with volumes added. If return_resnorm=True, returns
                 additional residual_history dict as last element.
                 If return_intermediate=True, returns full history arrays.
                 If return_intermediate=False, returns only final values.
-                
+
         Raises:
             ValueError: If is_mat_patch shape doesn't match number of elements.
             Exception: If Newton-Raphson iteration fails to converge.

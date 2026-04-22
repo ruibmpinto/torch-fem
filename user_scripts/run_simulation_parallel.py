@@ -3,8 +3,9 @@
 #                                                                       Modules
 # =============================================================================
 import torch
-from torch.utils.data import Dataset, DataLoader
 from run_simulation import Simulation
+from torch.utils.data import DataLoader, Dataset
+
 #
 #                                                          Authorship & Credits
 # =============================================================================
@@ -75,15 +76,15 @@ class SimulationDataset(Dataset):
 # =============================================================================
 def _collate_single(batch):
     """Unwrap single-item batch for DataLoader collation.
-    
+
     With batch_size=1:
 
     - Worker calls __getitem__(idx) once → returns single simulation result
     - collate_fn receives [result] (list with one element)
     - _collate_single unpacks to return result directly
-    
+
     With  batch_size=4:
-    
+
     - Worker calls __getitem__ 4 times → 4 independent simulations run
         sequentially in that worker
     - collate_fn receives [result1, result2, result3, result4]
@@ -179,4 +180,4 @@ if __name__ == '__main__':
         failure_log='failures.log',
     )
 
-    print(f'Completed!')
+    print('Completed!')

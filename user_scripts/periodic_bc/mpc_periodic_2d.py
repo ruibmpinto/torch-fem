@@ -6,12 +6,14 @@ Tests master-slave elimination for coupling opposite edges.
 """
 import os
 import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-import torch
 import matplotlib.pyplot as plt
-from torchfem.planar import Planar
+import torch
+
 from torchfem.materials import IsotropicElasticityPlaneStrain
 from torchfem.mesh import rect_quad
+from torchfem.planar import Planar
 
 # Material properties (aluminum)
 E = 70e3  # Young's modulus (MPa)
@@ -53,7 +55,7 @@ right_nodes = right_nodes[right_idx]
 bottom_nodes = bottom_nodes[bottom_idx]
 top_nodes = top_nodes[top_idx]
 
-print(f"\nBoundary nodes:")
+print("\nBoundary nodes:")
 print(f"  Left edge: {len(left_nodes)} nodes")
 print(f"  Right edge: {len(right_nodes)} nodes")
 print(f"  Bottom edge: {len(bottom_nodes)} nodes")
@@ -69,7 +71,7 @@ periodic_pairs = [
 
 fem.set_periodic_bc(periodic_pairs)
 
-print(f"\nPeriodic BC setup:")
+print("\nPeriodic BC setup:")
 print(f"  Total DOFs (full): {fem.n_dofs}")
 print(f"  Reduced DOFs: {fem.n_dofs_reduced}")
 print(f"  DOF reduction: {fem.n_dofs - fem.n_dofs_reduced} eliminated")
@@ -98,19 +100,19 @@ vertical_disp = 0.03 * L
 fem.constraints[mid_bottom_node, 1] = True
 fem.displacements[mid_bottom_node, 1] = vertical_disp
 
-print(f"\nBoundary conditions:")
+print("\nBoundary conditions:")
 print(f"  Fixed bottom-left corner: node {bottom_left_corner}")
 print(f"  Prescribed on mid-left (master): node {mid_left_node}, "
       f"u_x = {shear_disp}")
 print(f"  Prescribed on mid-bottom (master): node {mid_bottom_node}, "
       f"u_y = {vertical_disp}")
-print(f"  Periodic BCs on all edges")
+print("  Periodic BCs on all edges")
 
 # Solve
 print("\nSolving...")
 u, f, stress, _, _ = fem.solve(verbose=True)
 
-print(f"\nSolution:")
+print("\nSolution:")
 print(f"  Max displacement: {u.abs().max():.6e}")
 print(f"  Max stress: {stress.abs().max():.3f} MPa")
 

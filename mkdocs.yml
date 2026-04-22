@@ -1,0 +1,73 @@
+theme:
+    name: material
+    features:
+        - navigation.sections
+        - toc.integrate
+        - header.autohide
+        - content.code.copy
+    palette:
+        - scheme: default
+          primary: white
+          accent: amber
+          toggle:
+             icon: material/weather-night
+             name: Switch to dark mode
+        - scheme: slate
+          primary: black
+          accent: amber
+          toggle:
+             icon: material/weather-sunny
+             name: Switch to light mode
+    icon:
+        repo: fontawesome/brands/github
+
+site_name: torch-fem
+site_description: GPU accelerated differentiable finite elements for solid mechanics with PyTorch.
+site_author: Rui Barreira Morais Pinto
+site_url: https://ruibmpinto.github.io/torch-fem/
+
+repo_url: https://github.com/ruibmpinto/torch-fem
+repo_name: ruibmpinto/torch-fem
+edit_uri: ""
+
+strict: false
+
+markdown_extensions:
+    - attr_list
+    - md_in_html
+    - pymdownx.arithmatex:
+        generic: true
+    - pymdownx.superfences
+    - pymdownx.details
+    - admonition
+    - toc:
+        permalink: true
+        toc_depth: 4
+    - footnotes
+
+plugins:
+    - search
+    - mkdocstrings:
+        handlers:
+            python:
+                paths: [src]
+                options:
+                    docstring_style: numpy
+                    heading_level: 4
+                    inherited_members: true
+                    members_order: source
+                    show_bases: false
+                    show_if_no_docstring: true
+                    show_root_heading: true
+                    show_signature_annotations: true
+                    show_source: true
+                    show_symbol_type_heading: true
+                    show_symbol_type_toc: true
+                    filters:
+                        - "!^__.*__$"
+
+nav:
+    - Home: 'index.md'
+    - Getting started: 'getting_started.md'
+    - API reference: 'api.md'
+    - License: 'license.md'

@@ -10,7 +10,11 @@ torch.set_default_dtype(torch.float64)
 
 
 class SDF:
-    def __init__(self, center: Tensor = torch.zeros(3), scale: Tensor = torch.ones(3)):
+    def __init__(
+        self,
+        center: Tensor = torch.zeros(3),
+        scale: Tensor = torch.ones(3),
+    ):
         self.center = center
         self.transform = torch.diag(1 / scale)
 
@@ -292,15 +296,25 @@ class Neovius(SDF):
 
     def _f(self, points: Tensor) -> Tensor:
         x, y, z = self._to_xyz(points)
-        return 3 * (torch.cos(x) + torch.cos(y) + torch.cos(z)) + 4 * torch.cos(
-            x
-        ) * torch.cos(y) * torch.cos(z)
+        return (
+            3 * (torch.cos(x) + torch.cos(y) + torch.cos(z))
+            + 4 * torch.cos(x) * torch.cos(y) * torch.cos(z)
+        )
 
     def _grad(self, points: Tensor) -> Tensor:
         x, y, z = self._to_xyz(points)
-        grad_x = -3 * torch.sin(x) - 4 * torch.sin(x) * torch.cos(y) * torch.cos(z)
-        grad_y = -3 * torch.sin(y) - 4 * torch.cos(x) * torch.sin(y) * torch.cos(z)
-        grad_z = -3 * torch.sin(z) - 4 * torch.cos(x) * torch.cos(y) * torch.sin(z)
+        grad_x = (
+            -3 * torch.sin(x)
+            - 4 * torch.sin(x) * torch.cos(y) * torch.cos(z)
+        )
+        grad_y = (
+            -3 * torch.sin(y)
+            - 4 * torch.cos(x) * torch.sin(y) * torch.cos(z)
+        )
+        grad_z = (
+            -3 * torch.sin(z)
+            - 4 * torch.cos(x) * torch.cos(y) * torch.sin(z)
+        )
         return torch.stack([grad_x, grad_y, grad_z], dim=1)
 
 
@@ -347,7 +361,11 @@ class Torus(SDF):
 
 
 class Box(SDF):
-    def __init__(self, center: Tensor = torch.zeros(3), size: Tensor = torch.ones(3)):
+    def __init__(
+        self,
+        center: Tensor = torch.zeros(3),
+        size: Tensor = torch.ones(3),
+    ):
         super().__init__(center)
         self.size = size
 
@@ -400,7 +418,9 @@ class Cylinder(SDF):
 
 class Plane(SDF):
     def __init__(
-        self, center: Tensor = torch.zeros(3), normal: Tensor = torch.tensor([0, 0, 1])
+        self,
+        center: Tensor = torch.zeros(3),
+        normal: Tensor = torch.tensor([0, 0, 1]),
     ):
         super().__init__(center)
         self.normal = normal / torch.norm(normal)

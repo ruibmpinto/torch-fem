@@ -1,10 +1,12 @@
-import meshzoo
-import torch
-import numpy as np
 import os
-import sys
 import pathlib
+import sys
+
 import matplotlib.pyplot as plt
+import meshzoo
+import numpy as np
+import torch
+
 # Get the current working directory and build the path
 graphorge_path = str(pathlib.Path(os.getcwd()).parents[1] / \
                      "graphorge_material_patches" / "src")
@@ -13,8 +15,11 @@ if graphorge_path not in sys.path:
 if graphorge_path not in sys.path:
     sys.path.insert(0, graphorge_path)
 from torchfem import Planar
-from torchfem.materials import IsotropicElasticityPlaneStress, \
-    IsotropicElasticityPlaneStrain
+from torchfem.materials import (
+    IsotropicElasticityPlaneStrain,
+    IsotropicElasticityPlaneStress,
+)
+
 #
 #                                                          Authorship & Credits
 # =============================================================================
@@ -34,7 +39,7 @@ def create_connected_l_mesh(size=1.0, n_elements=20):
     nodes = []
     node_dict = {}
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Generate nodes for entire [0,1]x[0,1] domain, 
+    # Generate nodes for entire [0,1]x[0,1] domain,
     # skipping lower-right quadrant
     for j in range(n_elements + 1):
         for i in range(n_elements + 1):
@@ -78,7 +83,7 @@ def run_l_shape_example():
     # Fix bottom edge (y = 0)
     bottom_nodes = nodes[:, 1] == 0.0
     model.constraints[bottom_nodes, :] = True
-    # Fix left edge (x = 0)  
+    # Fix left edge (x = 0)
     left_nodes = nodes[:, 0] == 0.0
     model.constraints[left_nodes, :] = True
     # Apply displacement to right edge of top part (x = 1.0, y >= 0.5)
@@ -165,7 +170,8 @@ def run_l_shape_example():
 #         for i in range(n_elements + 1):
 #             x, y = i * element_size, j * element_size
 
-#             # Skip lower-right quadrant (x > total_size/2 and y < total_size/2)
+#             # Skip lower-right quadrant
+#             # (x > total_size/2 and y < total_size/2)
 #             if x > total_size/2 and y < total_size/2:
 #                 continue
 

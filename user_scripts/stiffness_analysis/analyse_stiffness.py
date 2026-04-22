@@ -17,14 +17,15 @@ compute_matrix_metrics
 #                                                          Modules
 # =============================================================================
 # Standard
-import os
-import re
 import glob
+import os
 import pathlib
+import re
+
+import matplotlib.pyplot as plt
 
 # Third-party
 import numpy as np
-import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
 #
@@ -487,7 +488,7 @@ def plot_eigenvalue_spectra(all_K, ref_stiffness,
         ax = axes[row, col]
         K_dict = all_K[res]
         # Overlay all surrogate spectra
-        for (pid, inc), K in K_dict.items():
+        for (_pid, _inc), K in K_dict.items():
             eigs = np.linalg.eigvalsh(
                 K.astype(np.float64))
             ax.plot(range(len(eigs)), np.sort(eigs),
@@ -573,7 +574,7 @@ def plot_eigenvalue_spectra_zoom(all_K, ref_stiffness,
         ax = axes[row, col]
         K_dict = all_K[res]
         # Overlay all surrogate spectra (first n_eig)
-        for (pid, inc), K in K_dict.items():
+        for (_pid, _inc), K in K_dict.items():
             eigs = np.sort(np.linalg.eigvalsh(
                 K.astype(np.float64)))
             ax.plot(

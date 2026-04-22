@@ -3,15 +3,16 @@
 #                                                                       Modules
 # =============================================================================
 # Standard
+import cProfile
 import os
-import sys
 import pathlib
 import pickle as pkl
-import psutil
-import time
-import signal
-import cProfile
 import pstats
+import signal
+import sys
+import time
+
+import psutil
 import scalene
 
 # Add graphorge to sys.path
@@ -21,30 +22,32 @@ if graphorge_path not in sys.path:
     sys.path.insert(0, graphorge_path)
 
 # Third-party
-import torch
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 # Enable graphorge imports in torchfem
 os.environ['TORCHFEM_IMPORT_GRAPHORGE'] = '1'
 
 # Local
-from torchfem import Solid, Planar
+from utils.boundary_conditons import prescribe_disps_by_coords
+from utils.plotting import (
+    plot_boundary_error_overlay,
+    plot_boundary_overlay,
+    plot_boundary_panels,
+)
+
+from torchfem import Planar, Solid
+from torchfem.elements import linear_to_quadratic
 from torchfem.materials import (
-    IsotropicElasticityPlaneStrain, 
-    IsotropicPlasticityPlaneStrain,
-    IsotropicElasticity3D,
-    IsotropicPlasticity3D,
     Hyperelastic3D,
-    IsotropicHenckyPlaneStrain
+    IsotropicElasticity3D,
+    IsotropicElasticityPlaneStrain,
+    IsotropicHenckyPlaneStrain,
+    IsotropicPlasticity3D,
+    IsotropicPlasticityPlaneStrain,
 )
 from torchfem.mesh import cube_hexa, rect_quad
-from torchfem.elements import linear_to_quadratic
-
-from utils.boundary_conditons import \
-    prescribe_disps_by_coords
-from utils.plotting import plot_boundary_overlay, \
-    plot_boundary_panels, plot_boundary_error_overlay
 
 # Matplotlib.pyplot default parameters
 plt.rcParams.update({
@@ -95,24 +98,24 @@ def run_simulation_surrogate(
     # Monitor memory and time
     process = psutil.Process(os.getpid())
     start_time = time.time()
-    
+
     def print_status(location):
         current_time = time.time()
         memory_mb = process.memory_info().rss / 1024 / 1024
         print(f"[{location}] Time: {current_time - start_time:.2f}s, "
               f"Memory: {memory_mb:.1f}MB")
-    
+
     print_status("START")
-    
+
     # Set up signal handler to catch termination
     def signal_handler(signum, frame):
         print(f"\n[SIGNAL] Caught signal {signum}")
         print_status("SIGNAL_CAUGHT")
         sys.exit(1)
-    
+
     signal.signal(signal.SIGTERM, signal_handler)
     # Ctrl+C
-    signal.signal(signal.SIGINT, signal_handler)  
+    signal.signal(signal.SIGINT, signal_handler)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Determine element order and dimension
     if element_type in ['quad4', 'tri3', 'tetra4', 'hex8']:
@@ -140,7 +143,7 @@ def run_simulation_surrogate(
 
         e_young = 110000
         nu = 0.33
-        
+
         if dim == 2:
             material = IsotropicElasticityPlaneStrain(E=e_young, nu=nu)
         elif dim == 3:
@@ -163,7 +166,7 @@ def run_simulation_surrogate(
             logJ = 0.5 * torch.logdet(C)
             return (mu / 2 * (torch.trace(C) - 3.0) - mu * logJ +
                     lmbda / 2 * logJ**2)
-        
+
         if dim == 2:
             material = IsotropicHenckyPlaneStrain(E=e_young, nu=nu)
         elif dim == 3:
@@ -599,7 +602,7 @@ def run_simulation_surrogate(
         # is_stepwise = False
         increments = torch.linspace(0.0, 1.0, 11)
         # RNN-like behavior
-        is_stepwise = False 
+        is_stepwise = False
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     mesh_str = f"{mesh_nx}x{mesh_ny}"
     patch_str = f"{patch_size_x}x{patch_size_y}"
@@ -613,7 +616,7 @@ def run_simulation_surrogate(
         f"mesh_{mesh_str}", f"patch_{patch_str}",
         f"n_time_inc_{n_increments}")
     os.makedirs(output_dir, exist_ok=True)
-    
+
     # Plot mesh colored by material patch ID
     domain.plot(
         element_property=is_mat_patch.float(),
@@ -706,7 +709,7 @@ def run_simulation_surrogate(
     # Stop profiling and print results
     # profiler.disable()
     print_status("AFTER_SOLVE_MATPATCH")
-    
+
     # print("\n" + "="*60)
     # print("PROFILING RESULTS - TOP 15 BOTTLENECKS")
     # print("="*60)
@@ -737,11 +740,11 @@ def run_simulation_surrogate(
         'forces': f.detach().cpu().numpy(),
         'model_path': model_path,
         'material_patch_ids': is_mat_patch.detach().cpu().numpy()}
-    
+
     output_file = os.path.join(output_dir, "results.pkl")
     with open(output_file, 'wb') as file_handle:
         pkl.dump(results, file_handle)
-    
+
     print(f"Results saved to {output_file}")
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -836,7 +839,7 @@ def run_simulation_surrogate(
     domain.constraints = constraints_srg
     domain.displacements = displacements_bc_srg
 
-    f_diff = torch.abs(f[-1] - f_ref[-1]) 
+    f_diff = torch.abs(f[-1] - f_ref[-1])
 
     domain.plot(
         u=u_diff,

@@ -34,8 +34,12 @@ def get_cube(N, order=1):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Solve the cube problem.")
     parser.add_argument("-N", type=int, help="The value of N", default=10)
-    parser.add_argument("-device", type=str, help="Troch default device", default="cpu")
-    parser.add_argument("-order", type=int, help="The order of the element", default=1)
+    parser.add_argument(
+        "-device", type=str, help="Troch default device", default="cpu"
+    )
+    parser.add_argument(
+        "-order", type=int, help="The order of the element", default=1
+    )
     args = parser.parse_args()
 
     torch.set_default_device(args.device)

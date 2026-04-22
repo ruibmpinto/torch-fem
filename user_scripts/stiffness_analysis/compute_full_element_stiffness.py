@@ -22,10 +22,11 @@ plane_strain_tangent
 import os
 import pathlib
 
+import matplotlib.pyplot as plt
+import numpy as np
+
 # Third-party
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
 
 #
 #                                                 Authorship & Credits
@@ -730,11 +731,11 @@ if __name__ == '__main__':
                 tag = 'under'
             else:
                 tag = 'over'
-            print(f'  --- equispaced ---')
+            print('  --- equispaced ---')
             _print_diagnostics(
                 f'n_gauss={ng}x{ng} ({tag})',
                 K_eq)
-            print(f'  --- GLL ---')
+            print('  --- GLL ---')
             _print_diagnostics(
                 f'n_gauss={ng}x{ng} ({tag})',
                 K_gll)

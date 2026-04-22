@@ -16,17 +16,18 @@ compute_reference_stiffness
 # =============================================================================
 # Standard
 import os
-import sys
 import pathlib
+import sys
+
+import numpy as np
 
 # Third-party
 import torch
-import numpy as np
 
 # Local
 from torchfem import Planar
-from torchfem.mesh import rect_quad
 from torchfem.materials import IsotropicElasticityPlaneStrain
+from torchfem.mesh import rect_quad
 
 #
 #                                                 Authorship & Credits
@@ -192,7 +193,7 @@ if __name__ == '__main__':
         results_base, 'elastic', '2d', 'quad4',
         'stiffness_reference')
 
-    for (mx, my, px, py, n_inc) in configs:
+    for (mx, my, px, py, _n_inc) in configs:
         compute_reference_stiffness(
             patch_size_x=px,
             patch_size_y=py,

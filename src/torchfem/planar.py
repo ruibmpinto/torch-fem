@@ -57,7 +57,9 @@ class Planar(FEM):
 
     def compute_f(self, detJ: Tensor, B: Tensor, S: Tensor):
         """Element internal force vector."""
-        return torch.einsum("...,...,...ik,...ij->...kj", self.thickness, detJ, B, S)
+        return torch.einsum(
+            "...,...,...ik,...ij->...kj", self.thickness, detJ, B, S
+        )
 
     @torch.no_grad()
     def plot(

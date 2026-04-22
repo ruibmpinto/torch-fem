@@ -1,26 +1,24 @@
-import torch
 import os
-import sys
 import pathlib
 import pickle as pkl
+import sys
+
+import torch
+
 # Add graphorge to sys.path
 graphorge_path = str(pathlib.Path(__file__).parents[2] \
                      / "graphorge_material_patches" / "src")
 if graphorge_path not in sys.path:
     sys.path.insert(0, graphorge_path)
 
+import matplotlib.pyplot as plt
 import meshzoo
 import numpy as np
 
 from torchfem import Planar
-
 from torchfem.examples import get_example_file
 from torchfem.io import import_mesh
 from torchfem.materials import IsotropicElasticityPlaneStress
-
-
-import matplotlib.pyplot as plt
-
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 torch_fem_root = os.path.dirname(os.path.dirname(script_dir))
@@ -73,7 +71,7 @@ u, f, σ, F, α = cantilever.solve_matpatch( is_mat_patch=is_mat_patch,
         return_volumes=False)
 
 
-f_final = f[-1]  
+f_final = f[-1]
 
 cantilever.plot(
         u=f_final,

@@ -1,5 +1,3 @@
-from typing import List, Tuple
-
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import torch
@@ -66,13 +64,19 @@ def stiffness2voigt(C: Tensor) -> Tensor:
         return torch.stack(
             [
                 torch.stack(
-                    [C[..., 0, 0, 0, 0], C[..., 0, 0, 1, 1], C[..., 0, 0, 0, 1]], dim=-1
+                    [C[..., 0, 0, 0, 0],
+                     C[..., 0, 0, 1, 1],
+                     C[..., 0, 0, 0, 1]], dim=-1
                 ),
                 torch.stack(
-                    [C[..., 1, 1, 0, 0], C[..., 1, 1, 1, 1], C[..., 1, 1, 0, 1]], dim=-1
+                    [C[..., 1, 1, 0, 0],
+                     C[..., 1, 1, 1, 1],
+                     C[..., 1, 1, 0, 1]], dim=-1
                 ),
                 torch.stack(
-                    [C[..., 0, 1, 0, 0], C[..., 0, 1, 1, 1], C[..., 0, 1, 0, 1]], dim=-1
+                    [C[..., 0, 1, 0, 0],
+                     C[..., 0, 1, 1, 1],
+                     C[..., 0, 1, 0, 1]], dim=-1
                 ),
             ],
             dim=-1,
@@ -166,9 +170,15 @@ def voigt2stress(voigt: Tensor) -> Tensor:
     elif voigt.shape[-1] == 6:
         return torch.stack(
             [
-                torch.stack([voigt[..., 0], voigt[..., 5], voigt[..., 4]], dim=-1),
-                torch.stack([voigt[..., 5], voigt[..., 1], voigt[..., 3]], dim=-1),
-                torch.stack([voigt[..., 4], voigt[..., 3], voigt[..., 2]], dim=-1),
+                torch.stack(
+                    [voigt[..., 0], voigt[..., 5], voigt[..., 4]], dim=-1
+                ),
+                torch.stack(
+                    [voigt[..., 5], voigt[..., 1], voigt[..., 3]], dim=-1
+                ),
+                torch.stack(
+                    [voigt[..., 4], voigt[..., 3], voigt[..., 2]], dim=-1
+                ),
             ],
             dim=-1,
         )
@@ -190,13 +200,19 @@ def voigt2strain(voigt: Tensor) -> Tensor:
         return torch.stack(
             [
                 torch.stack(
-                    [voigt[..., 0], 0.5 * voigt[..., 5], 0.5 * voigt[..., 4]], dim=-1
+                    [voigt[..., 0],
+                     0.5 * voigt[..., 5],
+                     0.5 * voigt[..., 4]], dim=-1
                 ),
                 torch.stack(
-                    [0.5 * voigt[..., 5], voigt[..., 1], 0.5 * voigt[..., 3]], dim=-1
+                    [0.5 * voigt[..., 5],
+                     voigt[..., 1],
+                     0.5 * voigt[..., 3]], dim=-1
                 ),
                 torch.stack(
-                    [0.5 * voigt[..., 4], 0.5 * voigt[..., 3], voigt[..., 2]], dim=-1
+                    [0.5 * voigt[..., 4],
+                     0.5 * voigt[..., 3],
+                     voigt[..., 2]], dim=-1
                 ),
             ],
             dim=-1,
@@ -333,12 +349,12 @@ def voigt2stiffness(voigt: Tensor) -> Tensor:
 def plot_contours(
     x: Tensor,
     f: Tensor,
-    opti: Tensor | List = [],
-    figsize: Tuple[float, float] = (8, 6),
+    opti=None,
+    figsize: tuple[float, float] = (8, 6),
     levels: int = 25,
     title: str = "",
-    box: List[Tensor] | None = None,
-    paths: dict[str, list] = {},
+    box: list[Tensor] | None = None,
+    paths=None,
     colorbar: bool = False,
 ):
     """Function to plot contours of a function f(x) in 2D.
@@ -354,9 +370,16 @@ def plot_contours(
         box: Tuple representing the box coordinates for the contour plot.
         paths: Dictionary of paths to plot.
         colorbar: Boolean indicating whether to show the colorbar."""
+    if opti is None:
+        opti = []
+    if paths is None:
+        paths = {}
     with torch.no_grad():
         plt.figure(figsize=figsize)
-        plt.contour(x[..., 0], x[..., 1], f, levels=levels, colors="k", linewidths=0.5)
+        plt.contour(
+            x[..., 0], x[..., 1], f,
+            levels=levels, colors="k", linewidths=0.5
+        )
         if box is not None:
             cond = (
                 (x[..., 0] > box[0][0])

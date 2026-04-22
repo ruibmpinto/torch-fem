@@ -5,10 +5,11 @@ Demonstrates periodic BCs on a unit cube subjected to uniaxial strain.
 Tests master-slave elimination for coupling opposite faces.
 """
 
-import torch
 import numpy as np
-from torchfem.solid import Solid
+import torch
+
 from torchfem.materials import IsotropicElasticity
+from torchfem.solid import Solid
 
 # Material properties (steel)
 E = 200e3  # Young's modulus (MPa)
@@ -64,7 +65,7 @@ face_yL = torch.where(torch.abs(nodes[:, 1] - L) < tol)[0]
 face_z0 = torch.where(torch.abs(nodes[:, 2]) < tol)[0]
 face_zL = torch.where(torch.abs(nodes[:, 2] - L) < tol)[0]
 
-print(f"\nBoundary nodes:")
+print("\nBoundary nodes:")
 print(f"  x=0 face: {len(face_x0)} nodes")
 print(f"  x=L face: {len(face_xL)} nodes")
 print(f"  y=0 face: {len(face_y0)} nodes")
@@ -157,7 +158,7 @@ for i in range(len(z0_matched)):
         C[constraint_idx, node0 * 3 + dof] = -1.0
         constraint_idx += 1
 
-print(f"\nMPC setup:")
+print("\nMPC setup:")
 print(f"  X-periodic nodes: {x_periodic_nodes}")
 print(f"  Y-periodic nodes: {y_periodic_nodes}")
 print(f"  Z-periodic nodes: {z_periodic_nodes}")
@@ -193,7 +194,7 @@ fem.displacements[corner_000, :] = 0.0
 # Apply tensile force in z-direction
 fem.forces[corner_LLL, 2] = 500.0
 
-print(f"\nBoundary conditions:")
+print("\nBoundary conditions:")
 print(f"  Fixed corner (0,0,0): node {corner_000}")
 print(f"  Loaded corner (L,L,L): node {corner_LLL}")
 
@@ -201,7 +202,7 @@ print(f"  Loaded corner (L,L,L): node {corner_LLL}")
 print("\nSolving...")
 u, f, stress, _, _ = fem.solve(verbose=True)
 
-print(f"\nSolution:")
+print("\nSolution:")
 print(f"  Max displacement: {u.abs().max():.6e}")
 print(f"  Max stress: {stress.abs().max():.3f} MPa")
 
