@@ -1500,28 +1500,44 @@ class FEM(ABC):
                 else:
                     return states
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Load patch-specific hidden states into model before inference
-            if is_stepwise and hidden_states and patch_id in hidden_states:
-                # patch_hidden = copy.deepcopy(hidden_states[patch_id])
-                patch_hidden = copy.deepcopy(
+            # Helper: load hidden states dict into model sub-components.
+            def _load_hidden_into_model(mdl, h):
+                """Set hidden states on encoder, processor, decoder."""
+                epd = mdl._gnn_epd_model
+                epd._hidden_states = h
+                if 'encoder' in h:
+                    epd._encoder._hidden_states = h['encoder']
+                if 'processor' in h:
+                    epd._processor._hidden_states = h['processor']
+                    for li, layer in enumerate(
+                            epd._processor._processor):
+                        lk = f'layer_{li}'
+                        if lk in h['processor']:
+                            layer._hidden_states = h['processor'][lk]
+                if 'decoder' in h:
+                    epd._decoder._hidden_states = h['decoder']
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Snapshot h0 for this patch so it can be restored before
+            # every forward/jvp call. Each call mutates model hidden
+            # states, so without restoration each Jacobian column would
+            # be linearized at a drifted operating point, producing an
+            # inconsistent tangent and Newton-Raphson divergence.
+            _h0_snapshot = None
+            if (is_stepwise and hidden_states
+                    and patch_id in hidden_states):
+                _h0_snapshot = copy.deepcopy(
                     detach_hidden_states(hidden_states[patch_id]))
-                model._gnn_epd_model._hidden_states = patch_hidden
-                # Set the model's hidden states to this patch's states
-                if 'encoder' in patch_hidden:
-                    model._gnn_epd_model._encoder._hidden_states = \
-                        patch_hidden['encoder']
-                if 'processor' in patch_hidden:
-                    model._gnn_epd_model._processor._hidden_states = \
-                        patch_hidden['processor']
-                    for i, layer in enumerate(
-                        model._gnn_epd_model._processor._processor):
-                        layer_key = f'layer_{i}'
-                        if layer_key in patch_hidden['processor']:
-                            layer._hidden_states = \
-                                patch_hidden['processor'][layer_key]
-                if 'decoder' in patch_hidden:
-                    model._gnn_epd_model._decoder._hidden_states = \
-                        patch_hidden['decoder']
+                _load_hidden_into_model(
+                    model, copy.deepcopy(_h0_snapshot))
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            def _restore_h0():
+                """Reload h0 so the next forward call sees the same
+                hidden state as every other jvp column."""
+                if _h0_snapshot is not None:
+                    _load_hidden_into_model(
+                        model,
+                        copy.deepcopy(
+                            detach_hidden_states(_h0_snapshot)))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute patch coordinate rescaling to [0,1]^d
             # GNN trained on patches with coords in [0,1]^d; rescale inputs
@@ -1585,6 +1601,7 @@ class FEM(ABC):
             # Compute Jacobian: d(forces_boundary)/d(u_boundary)
             if is_jacfwd_parallel:
                 # Parallel: all tangent vectors at once (high memory)
+                _restore_h0()
                 (jacobian, boundary_forces) = torch_func.jacfwd(
                     forward, has_aux=True)(boundary_u_current)
                 k_boundary = jacobian.view(
@@ -1592,10 +1609,19 @@ class FEM(ABC):
                 f_boundary = boundary_forces.flatten()
             else:
                 # Sequential: one jvp per DOF (constant memory)
+                # Restore h0 before force computation.
+                _restore_h0()
                 boundary_forces, _ = forward(boundary_u_current)
                 f_boundary = boundary_forces.flatten().detach()
+                # Save hidden_states_trial from the force eval — the
+                # per-column jvp calls below would overwrite it with
+                # drifted values.
+                _hs_trial_saved = hidden_states_trial
                 cols = []
                 for i in range(n_dof_boundary):
+                    # Restore h0 before each jvp so every column is
+                    # linearized at the same operating point.
+                    _restore_h0()
                     tangent = torch.zeros(
                         n_dof_boundary,
                         dtype=boundary_u_current.dtype)
@@ -1609,6 +1635,9 @@ class FEM(ABC):
                     cols.append(
                         jvp_col.flatten().detach())
                 k_boundary = torch.stack(cols, dim=1)
+                # Restore hidden_states_trial to the values from the
+                # force eval so the stepwise state carry is correct.
+                hidden_states_trial = _hs_trial_saved
             # Store per-patch boundary stiffness
             patch_stiffness_dict[idx_patch] = \
                 k_boundary.detach().clone()

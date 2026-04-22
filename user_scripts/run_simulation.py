@@ -302,7 +302,7 @@ class Simulation:
         is_save_avg_epbar=False,
         is_save_nodal_epbar=False,
         is_analytical_tangent=True,
-        is_adaptive_timestepping=True,
+        is_adaptive_timestepping=False,
         adaptive_max_subdiv=8,
         filepath='/Users/rbarreira/Desktop/'
                  'machine_learning/'
@@ -348,7 +348,7 @@ class Simulation:
             (UMAT-style) via
             `IsotropicPlasticityPlaneStrainUMAT` or
             `IsotropicPlasticity3DUMAT`.
-        is_adaptive_timestepping : bool, default=True
+        is_adaptive_timestepping : bool, default=False
             Enable adaptive sub-incrementation with
             retry-and-downsample on Newton-Raphson
             failure. If True, on convergence failure

@@ -169,7 +169,7 @@ if __name__ == '__main__':
             'is_compute_stiffness': False,
             'is_save_avg_epbar': False,
             'is_save_nodal_epbar': False,
-            'is_adaptive_timestepping': True,
+            'is_adaptive_timestepping': False,
             'adaptive_max_subdiv': 8,
         })
 
