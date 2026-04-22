@@ -1,0 +1,72 @@
+Model Configuration Summary
+===========================
+
+Patch size: 1x1
+Material: elastoplastic_nlh (Swift-Voce, AA2024)
+Element: quad4
+
+Model Architecture
+------------------
+n_dim: 2
+n_node_in: 4 (coord_x, coord_y, disp_x, disp_y)
+n_node_out: 2 (force_x, force_y)
+n_edge_in: 4 (edge_vec_x, edge_vec_y, rel_disp_x, rel_disp_y)
+n_edge_out: 0
+n_global_in: 0
+n_global_out: 0
+n_time_node: 101
+n_time_edge: 101
+n_time_global: 0
+n_message_steps: 1
+hidden_layer_size: 64
+total_parameters: 124678
+
+Encoder:  0 hidden layers, tanh/identity
+Processor: 4 hidden layers, tanh/identity
+Decoder:  0 hidden layers, tanh/identity
+
+Aggregation: add (edge-to-node), add (node-to-global)
+
+Constraints
+-----------
+is_force_equilibrium: False
+is_force_moment_equilibrium: True
+
+Edge Features
+-------------
+edge_feature_type: ('edge_vector', 'relative_disp')
+Features: edge_vector (coords[i] - coords[j]),
+          relative_disp (disp[i] - disp[j])
+
+Edge Connectivity
+-----------------
+edge_type: 'all' (fully connected)
+
+Normalization
+-------------
+scaler_type: minmax
+is_model_in_normalized: True
+is_model_out_normalized: True
+
+node_features_in:  404 features, range ~[-0.050, 1.050]
+edge_features_in:  404 features, range ~[-1.099, 1.099]
+node_features_out: 202 features, range ~[-4390, 4390]
+
+Training
+--------
+n_max_epochs: 600
+training_data_size: 4000
+batch_size: 8
+loss_type: mse (on node_features_out)
+opt_algorithm: adam
+lr_init: 0.001
+lr_scheduler: explr (gamma=)
+best_loss: 3.05120338e-06 (epoch 599)
+total_training_time: 11:42:58
+
+Usage
+-----
+run_simulation_surrogate(
+    patch_size_x=2, patch_size_y=2,
+    edge_type='all',
+    edge_feature_type=('edge_vector', 'relative_disp'))

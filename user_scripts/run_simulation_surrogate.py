@@ -77,8 +77,7 @@ def run_simulation_surrogate(
         patch_size_z=1,
         model_path=None, edge_type='all',
         edge_feature_type=('edge_vector',),
-        fe_border=0, patch_zones=None,
-        is_state_variable=False):
+        fe_border=0, patch_zones=None):
     """Run simulation with Graphorge surrogate model.
 
     Parameters
@@ -318,13 +317,11 @@ def run_simulation_surrogate(
             if material_behavior in (
                     'elastoplastic',
                     'elastoplastic_nlh'):
-                subdir = ('elastoplastic_nlh'
-                          if is_state_variable
-                          else 'elastoplastic_nlh')
                 model_directory_map[res] = (
                     os.path.join(
                         surrogates_dir,
-                        subdir, ps, 'model'))
+                        'elastoplastic_nlh',
+                        ps, 'model'))
             else:
                 model_directory_map[res] = (
                     os.path.join(
@@ -339,12 +336,9 @@ def run_simulation_surrogate(
         if material_behavior in (
                 'elastoplastic',
                 'elastoplastic_nlh'):
-            subdir = ('elastoplastic_nlh'
-                      if is_state_variable
-                      else 'elastoplastic_nlh')
             model_directory_map = os.path.join(
                 surrogates_dir,
-                subdir, ps, 'model')
+                'elastoplastic_nlh', ps, 'model')
         else:
             model_directory_map = os.path.join(
                 surrogates_dir,
@@ -598,12 +592,7 @@ def run_simulation_surrogate(
     if material_behavior in (
             'elastoplastic', 'elastoplastic_nlh'):
         increments = torch.linspace(0.0, 1.0, 51)
-        # Use state variable mode if requested,
-        # otherwise fall back to RNN stepwise
-        if is_state_variable:
-            is_stepwise = False
-        else:
-            is_stepwise = True
+        is_stepwise = True
     else:
         # One step for elastic sim
         # increments = torch.tensor([0.0, 1.0])
@@ -709,7 +698,6 @@ def run_simulation_surrogate(
         is_export_stiffness=True,
         stiffness_output_dir=stiffness_dir,
         patch_size_label=patch_str,
-        is_state_variable=is_state_variable,
     )
     profiler_matpatch.disable()
     print("\n=== SOLVE_MATPATCH METHOD PROFILE ===")
@@ -910,9 +898,8 @@ if __name__ == '__main__':
         edge_feature_type=(
             'edge_vector', 'relative_disp'),
         # fe_border=0,
-        patch_size_x=5,
-        patch_size_y=5,
-        is_state_variable=False
+        patch_size_x=2,
+        patch_size_y=2,
         # patch_zones=[
         #     # Top-left 4x4: rows 0-3, cols 0-3
         #     {'region': (0, 4, 0, 4),
