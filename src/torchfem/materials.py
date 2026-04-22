@@ -1181,6 +1181,526 @@ class IsotropicPlasticityPlaneStrain(IsotropicElasticityPlaneStrain):
         return sigma_new, state_new, ddsdde
 
 
+# =============================================================================
+class IsotropicPlasticityPlaneStrainUMAT(IsotropicPlasticityPlaneStrain):
+    """UMAT-style J2 plasticity for plane strain.
+
+    Offers two tangent-computation strategies controlled by a single
+    dispatch flag. Both strategies share the return-mapping algorithm
+    inherited from `IsotropicPlasticityPlaneStrain`; only the
+    algorithmic tangent `ddsdde` differs.
+
+    When `is_analytical_tangent` is True, `step` delegates to the
+    parent class and returns the closed-form Simo-Taylor consistent
+    tangent. When False, `step` calls `_step_numerical_tangent` which
+    builds `ddsdde` by forward-differencing the return map over the
+    three independent plane-strain strain components (11, 22, 12).
+    This reproduces the behaviour of commercial FE codes with user-
+    defined UMATs where the analytic consistent tangent is impractical
+    to derive.
+
+    Attributes
+    ----------
+    _is_analytical_tangent : bool
+        Tangent-strategy dispatch flag.
+    _h_pert : float
+        Forward-difference step size for the perturbation tangent.
+
+    Methods
+    -------
+    step(H_inc, F, sigma, state, de0)
+        Strain-increment update with branched tangent.
+    vectorize(n_elem)
+        Return vectorised copy preserving UMAT attributes.
+
+    Notes
+    -----
+    The perturbation tangent is first-order accurate in `_h_pert`.
+    Newton convergence degrades from quadratic to linear in the
+    plastic regime; expect 30-50 percent more outer iterations than
+    the analytic mode at the same rtol.
+    """
+    def __init__(self, E, nu, sigma_f, sigma_f_prime,
+                 is_analytical_tangent=False, h_pert=1e-8,
+                 tolerance=1e-5, max_iter=10):
+        """Constructor.
+
+        Parameters
+        ----------
+        E : {float, torch.Tensor}
+            Young's modulus.
+        nu : {float, torch.Tensor}
+            Poisson's ratio.
+        sigma_f : Callable
+            Yield stress as function of equivalent plastic strain.
+        sigma_f_prime : Callable
+            Derivative of `sigma_f`.
+        is_analytical_tangent : bool, default=False
+            If True, use parent Simo-Taylor analytic tangent. If
+            False, use forward-difference perturbation tangent.
+        h_pert : float, default=1e-8
+            Forward-difference step size.
+        tolerance : float, default=1e-5
+            Local Newton convergence tolerance for return map.
+        max_iter : int, default=10
+            Maximum local Newton iterations for return map.
+        """
+        super().__init__(
+            E, nu, sigma_f, sigma_f_prime,
+            tolerance=tolerance, max_iter=max_iter)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Dispatch flag and perturbation step size
+        self._is_analytical_tangent = is_analytical_tangent
+        self._h_pert = h_pert
+    # -------------------------------------------------------------------------
+    def vectorize(self, n_elem):
+        """Return a vectorised copy preserving UMAT attributes.
+
+        Parameters
+        ----------
+        n_elem : int
+            Number of elements to vectorize the material for.
+
+        Returns
+        -------
+        material : IsotropicPlasticityPlaneStrainUMAT
+            Vectorised copy.
+        """
+        if self.is_vectorized:
+            return self
+        E = self.E.repeat(n_elem)
+        nu = self.nu.repeat(n_elem)
+        return IsotropicPlasticityPlaneStrainUMAT(
+            E, nu, self.sigma_f, self.sigma_f_prime,
+            is_analytical_tangent=self._is_analytical_tangent,
+            h_pert=self._h_pert,
+            tolerance=self.tolerance, max_iter=self.max_iter)
+    # -------------------------------------------------------------------------
+    def step(self, H_inc, F, sigma, state, de0):
+        """Strain increment with branched tangent.
+
+        Parameters
+        ----------
+        H_inc : torch.Tensor
+            Incremental displacement gradient of shape `(..., 2, 2)`.
+        F : torch.Tensor
+            Current deformation gradient of shape `(..., 2, 2)`.
+        sigma : torch.Tensor
+            Current Cauchy stress tensor of shape `(..., 2, 2)`.
+        state : torch.Tensor
+            Internal state variables of shape `(..., 2)`.
+        de0 : torch.Tensor
+            External small strain increment of shape `(..., 2, 2)`.
+
+        Returns
+        -------
+        sigma_new : torch.Tensor
+            Updated Cauchy stress tensor of shape `(..., 2, 2)`.
+        state_new : torch.Tensor
+            Updated internal state of shape `(..., 2)`.
+        ddsdde : torch.Tensor
+            Algorithmic tangent of shape `(..., 2, 2, 2, 2)`.
+        """
+        if self._is_analytical_tangent:
+            return super().step(H_inc, F, sigma, state, de0)
+        return self._step_numerical_tangent(
+            H_inc, F, sigma, state, de0)
+    # -------------------------------------------------------------------------
+    def _return_map(self, de, sigma, state, de0):
+        """Stress/state return-map without tangent.
+
+        Reproduces the parent `step` logic through the stress/state
+        update, omitting the `ddsdde` construction block. Used by
+        both the reference call and the perturbation calls inside
+        `_step_numerical_tangent`.
+
+        Parameters
+        ----------
+        de : torch.Tensor
+            Symmetric small strain increment of shape `(..., 2, 2)`.
+        sigma : torch.Tensor
+            Current Cauchy stress of shape `(..., 2, 2)`.
+        state : torch.Tensor
+            Internal state of shape `(..., 2)`.
+        de0 : torch.Tensor
+            External strain increment of shape `(..., 2, 2)`.
+
+        Returns
+        -------
+        sigma_new : torch.Tensor
+            Updated Cauchy stress of shape `(..., 2, 2)`.
+        state_new : torch.Tensor
+            Updated internal state of shape `(..., 2)`.
+        fm : torch.Tensor
+            Boolean mask of yielded points of shape `(...,)`.
+        """
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Solution variables
+        sigma_new = sigma.clone()
+        state_new = state.clone()
+        q = state_new[..., 0]
+        ez = state_new[..., 1]
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Compute trial stress (build 3x3 representation for plane-strain)
+        s_2D = sigma + torch.einsum(
+            '...ijkl,...kl->...ij', self.C, de - de0)
+        s_trial = torch.zeros(sigma.shape[0], 3, 3,
+                              dtype=sigma.dtype, device=sigma.device)
+        s_trial[..., :2, :2] = s_2D
+        s_trial[..., 2, 2] = (
+            self.nu * (s_2D[..., 0, 0] + s_2D[..., 1, 1])
+            - self.E * ez)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Deviatoric trial stress and norm
+        s_trial_trace = (
+            s_trial[..., 0, 0] + s_trial[..., 1, 1]
+            + s_trial[..., 2, 2])
+        dev = s_trial.clone()
+        dev[..., 0, 0] -= s_trial_trace / 3
+        dev[..., 1, 1] -= s_trial_trace / 3
+        dev[..., 2, 2] -= s_trial_trace / 3
+        dev_norm = torch.linalg.norm(dev, dim=(-1, -2))
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Flow potential and yield mask
+        f = dev_norm - sqrt(2.0 / 3.0) * self.sigma_f(q)
+        fm = f > 0
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Direction of flow and local Newton on plastic multiplier
+        n = dev[fm] / dev_norm[fm][..., None, None]
+        dGamma = torch.zeros_like(f[fm])
+        G = self.G[fm]
+        for _ in range(self.max_iter):
+            res = (dev_norm[fm] - 2.0 * G * dGamma
+                   - sqrt(2.0 / 3.0) * self.sigma_f(q[fm]))
+            ddGamma = res / (
+                2.0 * G + 2.0 / 3.0 * self.sigma_f_prime(q[fm]))
+            dGamma += ddGamma
+            q[fm] += sqrt(2.0 / 3.0) * ddGamma
+            if (torch.abs(res) < self.tolerance).all():
+                break
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Update stress and state (plane-strain 2D components only)
+        sigma_new[~fm] = s_trial[~fm][..., :2, :2]
+        sigma_new[fm] = (
+            s_trial[fm]
+            - (2.0 * G * dGamma)[:, None, None] * n
+        )[..., :2, :2]
+        state_new[..., 0] = q
+        ez[fm] += dGamma * n[..., 2, 2]
+        state_new[..., 1] = ez
+        return sigma_new, state_new, fm
+    # -------------------------------------------------------------------------
+    def _step_numerical_tangent(self, H_inc, F, sigma, state, de0):
+        """Forward-difference perturbation tangent.
+
+        Computes `ddsdde` by perturbing the three independent plane-
+        strain strain components and finite-differencing the return
+        map. Applied only on yielded points; elastic points keep the
+        elastic stiffness `self.C`.
+
+        Parameters
+        ----------
+        H_inc : torch.Tensor
+            Incremental displacement gradient of shape `(..., 2, 2)`.
+        F : torch.Tensor
+            Current deformation gradient of shape `(..., 2, 2)`.
+        sigma : torch.Tensor
+            Current Cauchy stress of shape `(..., 2, 2)`.
+        state : torch.Tensor
+            Internal state of shape `(..., 2)`.
+        de0 : torch.Tensor
+            External strain increment of shape `(..., 2, 2)`.
+
+        Returns
+        -------
+        sigma_new : torch.Tensor
+            Updated stress of shape `(..., 2, 2)`.
+        state_new : torch.Tensor
+            Updated state of shape `(..., 2)`.
+        ddsdde : torch.Tensor
+            Algorithmic tangent of shape `(..., 2, 2, 2, 2)`.
+        """
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Symmetric small strain increment
+        de = 0.5 * (H_inc.transpose(-1, -2) + H_inc)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Unperturbed return map
+        sigma_new, state_new, fm = self._return_map(
+            de, sigma, state, de0)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Elastic baseline tangent everywhere
+        ddsdde = self.C.clone()
+        if not fm.any():
+            return sigma_new, state_new, ddsdde
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Independent strain components and their contribution to the
+        # symmetric strain perturbation: a unit bump of `H[i, j]`
+        # (displacement gradient) maps to `de[i, j] += 1` on diagonals
+        # and `de[i, j] += 0.5, de[j, i] += 0.5` on off-diagonals.
+        # Finite-differencing this recovers `dsigma/dH[i, j]` which
+        # matches the ddsdde convention used by the parent class.
+        #
+        # Perturb on the full batch rather than the fm subset so that
+        # per-element material attributes (`self.C`, `self.G`, etc.)
+        # keep the batch dimension that was fixed by `vectorize`. The
+        # result is later masked by `fm` before being written to
+        # `ddsdde`, so elastic-point work is discarded.
+        h = self._h_pert
+        comps = [(0, 0, 1.0), (1, 1, 1.0), (0, 1, 0.5)]
+        for (i, j, w) in comps:
+            de_p = de.clone()
+            de_p[..., i, j] = de_p[..., i, j] + w * h
+            if i != j:
+                de_p[..., j, i] = de_p[..., j, i] + w * h
+            sigma_p, _, _ = self._return_map(de_p, sigma, state, de0)
+            d_sig = (sigma_p - sigma_new) / h
+            ddsdde[fm, :, :, i, j] = d_sig[fm]
+            if i != j:
+                ddsdde[fm, :, :, j, i] = d_sig[fm]
+        return sigma_new, state_new, ddsdde
+
+
+# =============================================================================
+class IsotropicPlasticity3DUMAT(IsotropicPlasticity3D):
+    """UMAT-style J2 plasticity for 3D.
+
+    Three-dimensional counterpart of
+    `IsotropicPlasticityPlaneStrainUMAT`. Perturbation tangent acts
+    on the six independent 3D strain components (11, 22, 33, 12, 13,
+    23).
+
+    Attributes
+    ----------
+    _is_analytical_tangent : bool
+        Tangent-strategy dispatch flag.
+    _h_pert : float
+        Forward-difference step size.
+
+    Methods
+    -------
+    step(H_inc, F, sigma, state, de0)
+        Strain-increment update with branched tangent.
+    vectorize(n_elem)
+        Return vectorised copy preserving UMAT attributes.
+    """
+    def __init__(self, E, nu, sigma_f, sigma_f_prime,
+                 is_analytical_tangent=False, h_pert=1e-8,
+                 tolerance=1e-5, max_iter=10):
+        """Constructor.
+
+        Parameters
+        ----------
+        E : {float, torch.Tensor}
+            Young's modulus.
+        nu : {float, torch.Tensor}
+            Poisson's ratio.
+        sigma_f : Callable
+            Yield stress as function of equivalent plastic strain.
+        sigma_f_prime : Callable
+            Derivative of `sigma_f`.
+        is_analytical_tangent : bool, default=False
+            If True, use parent Simo-Taylor analytic tangent. If
+            False, use forward-difference perturbation tangent.
+        h_pert : float, default=1e-8
+            Forward-difference step size.
+        tolerance : float, default=1e-5
+            Local Newton convergence tolerance for return map.
+        max_iter : int, default=10
+            Maximum local Newton iterations for return map.
+        """
+        super().__init__(
+            E, nu, sigma_f, sigma_f_prime,
+            tolerance=tolerance, max_iter=max_iter)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Dispatch flag and perturbation step size
+        self._is_analytical_tangent = is_analytical_tangent
+        self._h_pert = h_pert
+    # -------------------------------------------------------------------------
+    def vectorize(self, n_elem):
+        """Return a vectorised copy preserving UMAT attributes.
+
+        Parameters
+        ----------
+        n_elem : int
+            Number of elements to vectorize the material for.
+
+        Returns
+        -------
+        material : IsotropicPlasticity3DUMAT
+            Vectorised copy.
+        """
+        if self.is_vectorized:
+            return self
+        E = self.E.repeat(n_elem)
+        nu = self.nu.repeat(n_elem)
+        return IsotropicPlasticity3DUMAT(
+            E, nu, self.sigma_f, self.sigma_f_prime,
+            is_analytical_tangent=self._is_analytical_tangent,
+            h_pert=self._h_pert,
+            tolerance=self.tolerance, max_iter=self.max_iter)
+    # -------------------------------------------------------------------------
+    def step(self, H_inc, F, sigma, state, de0):
+        """Strain increment with branched tangent.
+
+        Parameters
+        ----------
+        H_inc : torch.Tensor
+            Incremental displacement gradient of shape `(..., 3, 3)`.
+        F : torch.Tensor
+            Current deformation gradient of shape `(..., 3, 3)`.
+        sigma : torch.Tensor
+            Current Cauchy stress of shape `(..., 3, 3)`.
+        state : torch.Tensor
+            Internal state of shape `(..., 1)`.
+        de0 : torch.Tensor
+            External strain increment of shape `(..., 3, 3)`.
+
+        Returns
+        -------
+        sigma_new : torch.Tensor
+            Updated stress of shape `(..., 3, 3)`.
+        state_new : torch.Tensor
+            Updated state of shape `(..., 1)`.
+        ddsdde : torch.Tensor
+            Algorithmic tangent of shape `(..., 3, 3, 3, 3)`.
+        """
+        if self._is_analytical_tangent:
+            return super().step(H_inc, F, sigma, state, de0)
+        return self._step_numerical_tangent(
+            H_inc, F, sigma, state, de0)
+    # -------------------------------------------------------------------------
+    def _return_map(self, de, sigma, state, de0):
+        """Stress/state return-map without tangent.
+
+        Reproduces parent 3D `step` logic through the stress/state
+        update, omitting the `ddsdde` construction block.
+
+        Parameters
+        ----------
+        de : torch.Tensor
+            Symmetric small strain increment of shape `(..., 3, 3)`.
+        sigma : torch.Tensor
+            Current Cauchy stress of shape `(..., 3, 3)`.
+        state : torch.Tensor
+            Internal state of shape `(..., 1)`.
+        de0 : torch.Tensor
+            External strain increment of shape `(..., 3, 3)`.
+
+        Returns
+        -------
+        sigma_new : torch.Tensor
+            Updated Cauchy stress of shape `(..., 3, 3)`.
+        state_new : torch.Tensor
+            Updated state of shape `(..., 1)`.
+        fm : torch.Tensor
+            Boolean mask of yielded points of shape `(...,)`.
+        """
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Solution variables
+        sigma_new = sigma.clone()
+        state_new = state.clone()
+        q = state_new[..., 0]
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Trial stress
+        s_trial = sigma + torch.einsum(
+            '...ijkl,...kl->...ij', self.C, de - de0)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Deviatoric trial stress and norm
+        s_trial_trace = (
+            s_trial[..., 0, 0] + s_trial[..., 1, 1]
+            + s_trial[..., 2, 2])
+        dev = s_trial.clone()
+        dev[..., 0, 0] -= s_trial_trace / 3
+        dev[..., 1, 1] -= s_trial_trace / 3
+        dev[..., 2, 2] -= s_trial_trace / 3
+        dev_norm = torch.linalg.norm(dev, dim=(-1, -2))
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Flow potential and yield mask
+        f = dev_norm - sqrt(2.0 / 3.0) * self.sigma_f(q)
+        fm = f > 0
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Local Newton for plastic multiplier
+        n = dev[fm] / dev_norm[fm][..., None, None]
+        dGamma = torch.zeros_like(f[fm])
+        G = self.G[fm]
+        for _ in range(self.max_iter):
+            res = (dev_norm[fm] - 2.0 * G * dGamma
+                   - sqrt(2.0 / 3.0) * self.sigma_f(q[fm]))
+            ddGamma = res / (
+                2.0 * G + 2.0 / 3.0 * self.sigma_f_prime(q[fm]))
+            dGamma += ddGamma
+            q[fm] += sqrt(2.0 / 3.0) * ddGamma
+            if (torch.abs(res) < self.tolerance).all():
+                break
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Update stress and state
+        sigma_new[~fm] = s_trial[~fm]
+        sigma_new[fm] = (
+            s_trial[fm] - (2.0 * G * dGamma)[:, None, None] * n)
+        state_new[..., 0] = q
+        return sigma_new, state_new, fm
+    # -------------------------------------------------------------------------
+    def _step_numerical_tangent(self, H_inc, F, sigma, state, de0):
+        """Forward-difference perturbation tangent (3D).
+
+        Perturbs the six independent strain components and finite-
+        differences the return map. Applied only on yielded points.
+
+        Parameters
+        ----------
+        H_inc : torch.Tensor
+            Incremental displacement gradient of shape `(..., 3, 3)`.
+        F : torch.Tensor
+            Current deformation gradient of shape `(..., 3, 3)`.
+        sigma : torch.Tensor
+            Current Cauchy stress of shape `(..., 3, 3)`.
+        state : torch.Tensor
+            Internal state of shape `(..., 1)`.
+        de0 : torch.Tensor
+            External strain increment of shape `(..., 3, 3)`.
+
+        Returns
+        -------
+        sigma_new : torch.Tensor
+            Updated stress of shape `(..., 3, 3)`.
+        state_new : torch.Tensor
+            Updated state of shape `(..., 1)`.
+        ddsdde : torch.Tensor
+            Algorithmic tangent of shape `(..., 3, 3, 3, 3)`.
+        """
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Symmetric small strain increment
+        de = 0.5 * (H_inc.transpose(-1, -2) + H_inc)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Unperturbed return map
+        sigma_new, state_new, fm = self._return_map(
+            de, sigma, state, de0)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Elastic baseline tangent everywhere
+        ddsdde = self.C.clone()
+        if not fm.any():
+            return sigma_new, state_new, ddsdde
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # See the 2D UMAT for the rationale behind (i, j, w) weighting
+        # and for the full-batch perturbation choice.
+        h = self._h_pert
+        comps = [
+            (0, 0, 1.0), (1, 1, 1.0), (2, 2, 1.0),
+            (0, 1, 0.5), (0, 2, 0.5), (1, 2, 0.5),
+        ]
+        for (i, j, w) in comps:
+            de_p = de.clone()
+            de_p[..., i, j] = de_p[..., i, j] + w * h
+            if i != j:
+                de_p[..., j, i] = de_p[..., j, i] + w * h
+            sigma_p, _, _ = self._return_map(de_p, sigma, state, de0)
+            d_sig = (sigma_p - sigma_new) / h
+            ddsdde[fm, :, :, i, j] = d_sig[fm]
+            if i != j:
+                ddsdde[fm, :, :, j, i] = d_sig[fm]
+        return sigma_new, state_new, ddsdde
+
+
 class IsotropicElasticity1D(Material):
     def __init__(self, E: float | Tensor):
         # Convert float inputs to tensors

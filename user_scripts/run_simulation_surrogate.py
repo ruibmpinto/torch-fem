@@ -16,7 +16,7 @@ import scalene
 
 # Add graphorge to sys.path
 graphorge_path = str(pathlib.Path(__file__).parents[2] \
-                     / "graphorge_material_patches" / "src")
+                     / "graphorge" / "src")
 if graphorge_path not in sys.path:
     sys.path.insert(0, graphorge_path)
 
@@ -77,7 +77,8 @@ def run_simulation_surrogate(
         patch_size_z=1,
         model_path=None, edge_type='all',
         edge_feature_type=('edge_vector',),
-        fe_border=0, patch_zones=None):
+        fe_border=0, patch_zones=None,
+        is_state_variable=False):
     """Run simulation with Graphorge surrogate model.
 
     Parameters
@@ -241,11 +242,13 @@ def run_simulation_surrogate(
         if dim == 2:
             material = IsotropicPlasticityPlaneStrain(
                 E=e_young, nu=nu, sigma_f=sigma_f,
-                sigma_f_prime=sigma_f_prime)
+                sigma_f_prime=sigma_f_prime,
+                max_iter=50)
         elif dim == 3:
             material = IsotropicPlasticity3D(
                 E=e_young, nu=nu, sigma_f=sigma_f,
-                sigma_f_prime=sigma_f_prime)
+                sigma_f_prime=sigma_f_prime,
+                max_iter=50)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Geometry & mesh
     if dim == 2:
@@ -313,12 +316,15 @@ def run_simulation_surrogate(
         for res in unique_res:
             ps = f'{res[0]}x{res[1]}'
             if material_behavior in (
-                    'elastoplastic', 'elastoplastic_nlh'):
+                    'elastoplastic',
+                    'elastoplastic_nlh'):
+                subdir = ('elastoplastic_nlh'
+                          if is_state_variable
+                          else 'elastoplastic_nlh')
                 model_directory_map[res] = (
                     os.path.join(
                         surrogates_dir,
-                        'elastoplastic_nlh',
-                        ps, 'model'))
+                        subdir, ps, 'model'))
             else:
                 model_directory_map[res] = (
                     os.path.join(
@@ -331,14 +337,19 @@ def run_simulation_surrogate(
         res = list(unique_res)[0]
         ps = f'{res[0]}x{res[1]}'
         if material_behavior in (
-                'elastoplastic', 'elastoplastic_nlh'):
+                'elastoplastic',
+                'elastoplastic_nlh'):
+            subdir = ('elastoplastic_nlh'
+                      if is_state_variable
+                      else 'elastoplastic_nlh')
             model_directory_map = os.path.join(
                 surrogates_dir,
-                'elastoplastic_nlh', ps, 'model')
+                subdir, ps, 'model')
         else:
             model_directory_map = os.path.join(
                 surrogates_dir,
-                material_behavior, ps, 'model_rbmdelete')
+                material_behavior,
+                ps, 'model_rbmdelete')
         patch_resolution_arg = None
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Build patch_elem_per_dim map
@@ -487,8 +498,10 @@ def run_simulation_surrogate(
     # Profile solve method
     profiler_solve = cProfile.Profile()
     profiler_solve.enable()
-    u_ref, f_ref, _, _, _ = domain.solve(
-        increments=increments_ref, rtol=1e-8)
+    u_ref, f_ref, _, _, state_ref, res_hist_ref = \
+        domain.solve(
+            increments=increments_ref, rtol=1e-8,
+            verbose=True, return_resnorm=True)
     profiler_solve.disable()
     print("\n=== SOLVE METHOD PROFILE ===")
     stats_solve = pstats.Stats(profiler_solve)
@@ -532,12 +545,42 @@ def run_simulation_surrogate(
     # Save reference results
     results_ref = {
         'displacements': u_ref.detach().cpu().numpy(),
-        'forces': f_ref.detach().cpu().numpy()
+        'forces': f_ref.detach().cpu().numpy(),
     }
-    ref_file = os.path.join(output_dir, "results_reference.pkl")
+    ref_file = os.path.join(
+        output_dir, "results_reference.pkl")
     with open(ref_file, 'wb') as fh:
         pkl.dump(results_ref, fh)
     print(f"Reference results saved to {ref_file}")
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Save reference residual and state to subdirectory
+    ref_results_dir = os.path.join(
+        output_dir, 'reference_results')
+    os.makedirs(ref_results_dir, exist_ok=True)
+    # Save residual history as CSV files
+    for inc, norms in res_hist_ref.items():
+        res0 = norms[0] if norms[0] > 0 else 1.0
+        rows = np.column_stack((
+            np.arange(len(norms)),
+            np.array(norms),
+            np.array(norms) / res0))
+        np.savetxt(
+            os.path.join(
+                ref_results_dir,
+                f'residual_inc{inc}.csv'),
+            rows,
+            delimiter=',',
+            header='iteration,absolute,relative',
+            comments='')
+    print(f'Reference residuals saved to '
+          f'{ref_results_dir}')
+    # Save equivalent plastic strain as pkl
+    epbar_file = os.path.join(
+        ref_results_dir, 'epbar.pkl')
+    with open(epbar_file, 'wb') as fh:
+        pkl.dump(
+            state_ref.detach().cpu().numpy(), fh)
+    print(f'Reference epbar saved to {epbar_file}')
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Save reference constraint state before locking internal
     # nodes (needed for plotting reference fields later)
@@ -552,10 +595,15 @@ def run_simulation_surrogate(
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Solver
     # Create more increments for elastoplastic simulation
-    if material_behavior in ('elastoplastic', 'elastoplastic_nlh'):
+    if material_behavior in (
+            'elastoplastic', 'elastoplastic_nlh'):
         increments = torch.linspace(0.0, 1.0, 51)
-        # RNN-like behavior
-        is_stepwise = True 
+        # Use state variable mode if requested,
+        # otherwise fall back to RNN stepwise
+        if is_state_variable:
+            is_stepwise = False
+        else:
+            is_stepwise = True
     else:
         # One step for elastic sim
         # increments = torch.tensor([0.0, 1.0])
@@ -661,6 +709,7 @@ def run_simulation_surrogate(
         is_export_stiffness=True,
         stiffness_output_dir=stiffness_dir,
         patch_size_label=patch_str,
+        is_state_variable=is_state_variable,
     )
     profiler_matpatch.disable()
     print("\n=== SOLVE_MATPATCH METHOD PROFILE ===")
@@ -854,15 +903,16 @@ if __name__ == '__main__':
     # Bot-right 4x4 block -> one 4x4 patch
     run_simulation_surrogate(
         element_type='quad4',
-        material_behavior='elastic',
-        mesh_nx=32,
-        mesh_ny=32,
+        material_behavior='elastoplastic_nlh',
+        mesh_nx=10,
+        mesh_ny=10,
         edge_type='all',
         edge_feature_type=(
             'edge_vector', 'relative_disp'),
         # fe_border=0,
-        patch_size_x=8,
-        patch_size_y=8
+        patch_size_x=5,
+        patch_size_y=5,
+        is_state_variable=False
         # patch_zones=[
         #     # Top-left 4x4: rows 0-3, cols 0-3
         #     {'region': (0, 4, 0, 4),

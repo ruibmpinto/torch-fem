@@ -27,6 +27,11 @@ class Element(ABC):
     def iweights(self) -> Tensor:
         pass
 
+    @abstractmethod
+    def npoints(self) -> Tensor:
+        """Natural coordinates of element nodes."""
+        pass
+
 
 class Bar1(Element):
     def __init__(self):
@@ -49,6 +54,9 @@ class Bar1(Element):
 
     def iweights(self) -> Tensor:
         return torch.tensor([2.0])
+
+    def npoints(self) -> Tensor:
+        return torch.tensor([[-1.0], [1.0]])
 
 
 class Bar2(Element):
@@ -82,6 +90,9 @@ class Bar2(Element):
     def iweights(self) -> Tensor:
         return torch.tensor([1.0, 1.0])
 
+    def npoints(self) -> Tensor:
+        return torch.tensor([[-1.0], [1.0], [0.0]])
+
 
 class Tria1(Element):
     def __init__(self):
@@ -105,6 +116,10 @@ class Tria1(Element):
 
     def iweights(self) -> Tensor:
         return torch.tensor([0.5])
+
+    def npoints(self) -> Tensor:
+        return torch.tensor([
+            [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
 
 
 class Tria2(Element):
@@ -156,6 +171,11 @@ class Tria2(Element):
     def iweights(self) -> Tensor:
         return torch.tensor([1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0])
 
+    def npoints(self) -> Tensor:
+        return torch.tensor([
+            [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+            [0.5, 0.0], [0.5, 0.5], [0.0, 0.5]])
+
 
 class Quad1(Element):
     def __init__(self):
@@ -205,6 +225,11 @@ class Quad1(Element):
     def iweights(self) -> Tensor:
         return torch.tensor([1, 1, 1, 1])
 
+    def npoints(self) -> Tensor:
+        return torch.tensor([
+            [-1.0, -1.0], [1.0, -1.0],
+            [1.0, 1.0], [-1.0, 1.0]])
+
 
 class Quad1r(Element):
     """Quad1 element with reduced integration (1 point).
@@ -253,6 +278,11 @@ class Quad1r(Element):
 
     def iweights(self) -> Tensor:
         return torch.tensor([4.0])
+
+    def npoints(self) -> Tensor:
+        return torch.tensor([
+            [-1.0, -1.0], [1.0, -1.0],
+            [1.0, 1.0], [-1.0, 1.0]])
 
 
 class Quad2(Element):
@@ -315,6 +345,13 @@ class Quad2(Element):
     def iweights(self) -> Tensor:
         return torch.tensor([1, 1, 1, 1])
 
+    def npoints(self) -> Tensor:
+        return torch.tensor([
+            [-1.0, -1.0], [1.0, -1.0],
+            [1.0, 1.0], [-1.0, 1.0],
+            [0.0, -1.0], [1.0, 0.0],
+            [0.0, 1.0], [-1.0, 0.0]])
+
 
 class Tetra1(Element):
     def __init__(self):
@@ -343,6 +380,11 @@ class Tetra1(Element):
 
     def iweights(self) -> Tensor:
         return torch.tensor([1.0 / 6.0])
+
+    def npoints(self) -> Tensor:
+        return torch.tensor([
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
 
 
 class Tetra2(Element):
@@ -430,6 +472,14 @@ class Tetra2(Element):
     def iweights(self) -> Tensor:
         return torch.tensor([0.041666667, 0.041666667, 0.041666667, 0.041666667])
 
+    def npoints(self) -> Tensor:
+        return torch.tensor([
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+            [0.5, 0.0, 0.0], [0.5, 0.5, 0.0],
+            [0.0, 0.5, 0.0], [0.0, 0.0, 0.5],
+            [0.5, 0.0, 0.5], [0.0, 0.5, 0.5]])
+
 
 class Hexa1(Element):
     def __init__(self):
@@ -506,6 +556,13 @@ class Hexa1(Element):
     def iweights(self) -> Tensor:
         return torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
 
+    def npoints(self) -> Tensor:
+        return torch.tensor([
+            [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0],
+            [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0],
+            [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]])
+
 
 class Hexa1r(Element):
     def __init__(self):
@@ -574,6 +631,13 @@ class Hexa1r(Element):
 
     def iweights(self) -> Tensor:
         return torch.tensor([8.0])
+
+    def npoints(self) -> Tensor:
+        return torch.tensor([
+            [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0],
+            [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0],
+            [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]])
 
 
 class Hexa2(Element):
@@ -810,6 +874,21 @@ class Hexa2(Element):
 
     def iweights(self) -> Tensor:
         return torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+
+    def npoints(self) -> Tensor:
+        return torch.tensor([
+            # 8 corner nodes
+            [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0],
+            [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0],
+            [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0],
+            # 12 midside nodes
+            [0.0, -1.0, -1.0], [1.0, 0.0, -1.0],
+            [0.0, 1.0, -1.0], [-1.0, 0.0, -1.0],
+            [0.0, -1.0, 1.0], [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0], [-1.0, 0.0, 1.0],
+            [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0], [-1.0, 1.0, 0.0]])
 
 
 def linear_to_quadratic(nodes: Tensor, elements: Tensor) -> tuple[Tensor, Tensor]:
