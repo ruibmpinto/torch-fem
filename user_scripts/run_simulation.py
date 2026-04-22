@@ -296,6 +296,8 @@ class Simulation:
         is_compute_stiffness=False,
         is_save_avg_epbar=False,
         is_save_nodal_epbar=False,
+        is_adaptive_timestepping=True,
+        adaptive_max_subdiv=8,
         filepath='/Users/rbarreira/Desktop/'
                  'machine_learning/'
                  'material_patches/_data/'
@@ -332,6 +334,26 @@ class Simulation:
             Save per-node equivalent plastic strain time
             series in output pickle (extrapolated from
             Gauss points).
+        is_adaptive_timestepping : bool, default=True
+            Enable adaptive sub-incrementation with
+            retry-and-downsample on Newton-Raphson
+            failure. If True, on convergence failure
+            `run()` re-solves with 2x, 4x, ... refinement
+            of the load factor sequence (up to
+            `adaptive_max_subdiv`) and downsamples solver
+            outputs back to the original time points. If
+            False, a single solve attempt is made with
+            the base increments; convergence failures
+            propagate as exceptions.
+        adaptive_max_subdiv : int, default=8
+            Maximum subdivision factor used when
+            `is_adaptive_timestepping` is True. The retry
+            sequence is the powers of 2 in
+            [1, adaptive_max_subdiv] (e.g. 8 gives
+            1, 2, 4, 8; 16 gives 1, 2, 4, 8, 16; 1
+            disables refinement). Must be an integer
+            >= 1. Ignored when
+            `is_adaptive_timestepping` is False.
         filepath : str
             Base path to material patch input data.
         """
@@ -347,6 +369,13 @@ class Simulation:
         self.is_compute_stiffness = is_compute_stiffness
         self.is_save_avg_epbar = is_save_avg_epbar
         self.is_save_nodal_epbar = is_save_nodal_epbar
+        self.is_adaptive_timestepping = (
+            is_adaptive_timestepping)
+        if adaptive_max_subdiv < 1:
+            raise ValueError(
+                f'adaptive_max_subdiv must be >= 1, '
+                f'got {adaptive_max_subdiv}.')
+        self.adaptive_max_subdiv = adaptive_max_subdiv
         self.filepath = filepath
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Determine element order and dimension
@@ -939,8 +968,70 @@ class Simulation:
                 dim=self.dim))
 
     # -------------------------------------------------------------------------
-    def solve(self):
+    def _get_base_increments(self):
+        """Return base increment sequence from patch.
+
+        Returns
+        -------
+        increments : torch.Tensor
+            Load factor sequence, length
+            num_increments + 1.
+        """
+        if self.num_increments == 1:
+            return torch.linspace(0.0, 1.0, 2)
+        return torch.tensor(
+            self.matpatch['load_factor_time_series'])
+
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _refine_increments(increments, n_subdiv):
+        """Subdivide each interval between load factors.
+
+        Inserts n_subdiv - 1 equally-spaced points
+        within each consecutive pair. Original points
+        remain at stride n_subdiv in the refined
+        sequence, so downsampling the solver output by
+        ``[::n_subdiv]`` recovers values at the
+        original time points.
+
+        Parameters
+        ----------
+        increments : torch.Tensor
+            Original increments, shape (N0,).
+        n_subdiv : int
+            Number of subintervals per original
+            segment. n_subdiv=1 returns input
+            unchanged.
+
+        Returns
+        -------
+        refined : torch.Tensor
+            Refined increments, shape
+            ((N0 - 1) * n_subdiv + 1,).
+        """
+        if n_subdiv == 1:
+            return increments
+        pieces = []
+        for i in range(len(increments) - 1):
+            a = increments[i].item()
+            b = increments[i + 1].item()
+            for k in range(n_subdiv):
+                pieces.append(
+                    a + (b - a) * k / n_subdiv)
+        pieces.append(increments[-1].item())
+        return torch.tensor(
+            pieces, dtype=increments.dtype)
+
+    # -------------------------------------------------------------------------
+    def solve(self, increments=None):
         """Solve the FEM system.
+
+        Parameters
+        ----------
+        increments : {torch.Tensor, None}, default=None
+            Optional override of the increment
+            sequence. If None, uses base increments
+            from the patch.
 
         Returns
         -------
@@ -948,11 +1039,8 @@ class Simulation:
             (u_disp, f_int, sigma_out, def_grad,
              alpha_out, vol_elem).
         """
-        if self.num_increments == 1:
-            increments = torch.linspace(0.0, 1.0, 2)
-        elif self.num_increments > 1:
-            increments = torch.tensor(
-                self.matpatch['load_factor_time_series'])
+        if increments is None:
+            increments = self._get_base_increments()
         return self.domain.solve(
             increments=increments,
             return_intermediate=True,
@@ -1155,7 +1243,26 @@ class Simulation:
 
     # -------------------------------------------------------------------------
     def run(self):
-        """Execute complete simulation workflow."""
+        """Execute complete simulation workflow.
+
+        If ``self.is_adaptive_timestepping`` is True,
+        applies retry-and-downsample on Newton-Raphson
+        failure: re-solves with 2x, 4x, 8x refinement
+        of the load factor sequence and downsamples
+        back to the original time points. If False,
+        performs a single solve attempt at the base
+        increments and propagates convergence failures.
+
+        Raises
+        ------
+        RuntimeError
+            If adaptive timestepping is enabled and
+            Newton-Raphson fails at all subdivision
+            levels (1x, 2x, 4x, 8x).
+        Exception
+            If adaptive timestepping is disabled and
+            Newton-Raphson fails on the single solve.
+        """
         self.load_material_patch()
         material = self.create_material()
         self.domain = self.create_mesh(material)
@@ -1166,7 +1273,49 @@ class Simulation:
             self.compute_boundary_stiffness()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         self.apply_boundary_conditions()
-        results = self.solve()
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Solve (with optional adaptive sub-increment)
+        if not self.is_adaptive_timestepping:
+            results = self.solve()
+        else:
+            base_incr = self._get_base_increments()
+            # Build powers-of-2 sequence in
+            # [1, adaptive_max_subdiv]
+            subdiv_seq = []
+            k = 1
+            while k <= self.adaptive_max_subdiv:
+                subdiv_seq.append(k)
+                k *= 2
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            results = None
+            used_subdiv = 1
+            last_exc = None
+            for n_subdiv in subdiv_seq:
+                incr = self._refine_increments(
+                    base_incr, n_subdiv)
+                try:
+                    results = self.solve(
+                        increments=incr)
+                    used_subdiv = n_subdiv
+                    if n_subdiv > 1:
+                        print(
+                            f'  patch {self.patch_idx}:'
+                            f' converged with '
+                            f'{n_subdiv}x '
+                            f'subincrementation')
+                    break
+                except Exception as excp:
+                    last_exc = excp
+            if results is None:
+                raise RuntimeError(
+                    f'Newton-Raphson failed for patch '
+                    f'{self.patch_idx} up to '
+                    f'{subdiv_seq[-1]}x '
+                    f'subincrementation: {last_exc}')
+            # Downsample refined results to base pts
+            if used_subdiv > 1:
+                results = tuple(
+                    r[::used_subdiv] for r in results)
         self.postprocess_results(*results)
         if self.is_save:
             self.save_results()
