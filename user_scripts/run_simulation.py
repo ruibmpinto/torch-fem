@@ -18,6 +18,7 @@ run_simulation
 #                                                                       Modules
 # =============================================================================
 # Standard
+import math
 import os
 import sys
 import pathlib
@@ -30,7 +31,7 @@ import torch.func as torch_func
 # Add graphorge to sys.path
 graphorge_path = str(
     pathlib.Path(__file__).parents[2] /
-    "graphorge_material_patches" / "src")
+    "graphorge" / "src")
 if graphorge_path not in sys.path:
     sys.path.insert(0, graphorge_path)
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -40,12 +41,17 @@ from torchfem.materials import (
     IsotropicElasticityPlaneStrain,
     IsotropicElasticityPlaneStress,
     IsotropicPlasticityPlaneStrain,
+    IsotropicPlasticityPlaneStrainUMAT,
     IsotropicPlasticityPlaneStress,
     IsotropicElasticity3D,
     IsotropicPlasticity3D,
+    IsotropicPlasticity3DUMAT,
     IsotropicHencky3D,
     Hyperelastic3D,
     IsotropicHenckyPlaneStrain
+)
+from torchfem.custom_materials.lou_zhang_yoon import (
+    LouZhangYoon3D, LouZhangYoonPlaneStrain
 )
 from torchfem.mesh import cube_hexa, rect_quad
 from torchfem.elements import (
@@ -296,6 +302,7 @@ class Simulation:
         is_compute_stiffness=False,
         is_save_avg_epbar=False,
         is_save_nodal_epbar=False,
+        is_analytical_tangent=True,
         is_adaptive_timestepping=True,
         adaptive_max_subdiv=8,
         filepath='/Users/rbarreira/Desktop/'
@@ -334,6 +341,14 @@ class Simulation:
             Save per-node equivalent plastic strain time
             series in output pickle (extrapolated from
             Gauss points).
+        is_analytical_tangent : bool, default=True
+            For elastoplastic materials, controls the
+            algorithmic tangent strategy. If True, use the
+            closed-form Simo-Taylor consistent tangent. If
+            False, use forward-difference perturbation
+            (UMAT-style) via
+            `IsotropicPlasticityPlaneStrainUMAT` or
+            `IsotropicPlasticity3DUMAT`.
         is_adaptive_timestepping : bool, default=True
             Enable adaptive sub-incrementation with
             retry-and-downsample on Newton-Raphson
@@ -369,6 +384,7 @@ class Simulation:
         self.is_compute_stiffness = is_compute_stiffness
         self.is_save_avg_epbar = is_save_avg_epbar
         self.is_save_nodal_epbar = is_save_nodal_epbar
+        self.is_analytical_tangent = is_analytical_tangent
         self.is_adaptive_timestepping = (
             is_adaptive_timestepping)
         if adaptive_max_subdiv < 1:
@@ -413,8 +429,9 @@ class Simulation:
     def _setup_paths(self):
         """Setup input and output file paths."""
         out_filepath = (
-            '/Users/rbarreira/Desktop/machine_learning/'
-            'material_patches/')
+            # '/Users/rbarreira/Desktop/machine_learning/'
+            # 'material_patches/')
+            '/Volumes/T7/material_patches/')
         is_irregular = 'irregular' in self.filepath
         if self.dim == 2:
             if is_irregular:
@@ -437,7 +454,7 @@ class Simulation:
                 f'material_patches_generation_'
                 f'{self.dim}d_{self.element_type}_mesh_'
                 f'{self.mesh_nx}x{self.mesh_ny}/'
-                f'material_patch_{self.patch_idx}/'
+                f'random_specimen_{self.patch_idx}/'
                 f'material_patch/'
                 f'material_patch_attributes.pkl')
         elif self.dim == 3:
@@ -527,13 +544,23 @@ class Simulation:
                 return hardening_modulus
 
             if self.dim == 2:
-                return IsotropicPlasticityPlaneStrain(
+                if self.is_analytical_tangent:
+                    return IsotropicPlasticityPlaneStrain(
+                        E=e_young, nu=nu, sigma_f=sigma_f,
+                        sigma_f_prime=sigma_f_prime)
+                return IsotropicPlasticityPlaneStrainUMAT(
                     E=e_young, nu=nu, sigma_f=sigma_f,
-                    sigma_f_prime=sigma_f_prime)
+                    sigma_f_prime=sigma_f_prime,
+                    is_analytical_tangent=False)
             elif self.dim == 3:
-                return IsotropicPlasticity3D(
+                if self.is_analytical_tangent:
+                    return IsotropicPlasticity3D(
+                        E=e_young, nu=nu, sigma_f=sigma_f,
+                        sigma_f_prime=sigma_f_prime)
+                return IsotropicPlasticity3DUMAT(
                     E=e_young, nu=nu, sigma_f=sigma_f,
-                    sigma_f_prime=sigma_f_prime)
+                    sigma_f_prime=sigma_f_prime,
+                    is_analytical_tangent=False)
         elif self.material_behavior == 'elastoplastic_nlh':
             e_young = 70000
             nu = 0.33
@@ -571,13 +598,87 @@ class Simulation:
                         + (1.0 - omega) * dkv)
 
             if self.dim == 2:
-                return IsotropicPlasticityPlaneStrain(
+                if self.is_analytical_tangent:
+                    return IsotropicPlasticityPlaneStrain(
+                        E=e_young, nu=nu, sigma_f=sigma_f,
+                        sigma_f_prime=sigma_f_prime)
+                return IsotropicPlasticityPlaneStrainUMAT(
                     E=e_young, nu=nu, sigma_f=sigma_f,
-                    sigma_f_prime=sigma_f_prime)
+                    sigma_f_prime=sigma_f_prime,
+                    is_analytical_tangent=False)
             elif self.dim == 3:
-                return IsotropicPlasticity3D(
+                if self.is_analytical_tangent:
+                    return IsotropicPlasticity3D(
+                        E=e_young, nu=nu, sigma_f=sigma_f,
+                        sigma_f_prime=sigma_f_prime)
+                return IsotropicPlasticity3DUMAT(
                     E=e_young, nu=nu, sigma_f=sigma_f,
-                    sigma_f_prime=sigma_f_prime)
+                    sigma_f_prime=sigma_f_prime,
+                    is_analytical_tangent=False)
+        elif self.material_behavior == 'lou_zhang_yoon':
+            # LZY returns the elastic tangent as algorithmic
+            # tangent placeholder; is_analytical_tangent has
+            # no effect on this branch.
+            e_young = 110000.0
+            nu = 0.33
+            s_0 = 900.0
+            s_1 = 700.0
+            s_2 = 0.5
+            yield_a_val = 1.0
+            yield_b_val = 0.05
+            yield_c_val = 1.0
+            yield_d_val = 0.5
+
+            def sigma_f(eps_pl):
+                """Voce hardening function."""
+                return s_0 + s_1 * (
+                    1.0 - torch.exp(-s_2 * eps_pl))
+
+            def sigma_f_prime(eps_pl):
+                """Derivative of Voce hardening."""
+                return (
+                    s_1 * s_2 * torch.exp(-s_2 * eps_pl))
+
+            def _const_fn(value):
+                """Constant-in-q callable."""
+                def fn(q):
+                    return value * torch.ones_like(q)
+                return fn
+
+            def _zero_fn():
+                """Zero-in-q callable."""
+                def fn(q):
+                    return torch.zeros_like(q)
+                return fn
+
+            if self.dim == 2:
+                return LouZhangYoonPlaneStrain(
+                    E=e_young, nu=nu,
+                    sigma_f=sigma_f,
+                    sigma_f_prime=sigma_f_prime,
+                    yield_a=_const_fn(yield_a_val),
+                    yield_a_prime=_zero_fn(),
+                    yield_b=_const_fn(yield_b_val),
+                    yield_b_prime=_zero_fn(),
+                    yield_c=_const_fn(yield_c_val),
+                    yield_c_prime=_zero_fn(),
+                    yield_d=_const_fn(yield_d_val),
+                    yield_d_prime=_zero_fn(),
+                    is_fixed_yield_parameters=True)
+            elif self.dim == 3:
+                return LouZhangYoon3D(
+                    E=e_young, nu=nu,
+                    sigma_f=sigma_f,
+                    sigma_f_prime=sigma_f_prime,
+                    yield_a=_const_fn(yield_a_val),
+                    yield_a_prime=_zero_fn(),
+                    yield_b=_const_fn(yield_b_val),
+                    yield_b_prime=_zero_fn(),
+                    yield_c=_const_fn(yield_c_val),
+                    yield_c_prime=_zero_fn(),
+                    yield_d=_const_fn(yield_d_val),
+                    yield_d_prime=_zero_fn(),
+                    is_fixed_yield_parameters=True)
         else:
             raise ValueError(
                 f'Unknown material behavior: '
@@ -823,7 +924,8 @@ class Simulation:
         }
         if (self.material_behavior in [
                 'elastoplastic_lh',
-                'elastoplastic_nlh']):
+                'elastoplastic_nlh',
+                'lou_zhang_yoon']):
             if self.is_save_avg_epbar:
                 self.simulation_data[
                     'epsilon_pl_eq'] = {}
@@ -1075,7 +1177,8 @@ class Simulation:
         if (self.is_save_nodal_epbar
                 and self.material_behavior in [
                     'elastoplastic_lh',
-                    'elastoplastic_nlh']):
+                    'elastoplastic_nlh',
+                    'lou_zhang_yoon']):
             n_inc = alpha_out.shape[0]
             n_nod = self.domain.n_nod
             nodal_epbar = torch.zeros(n_inc, n_nod)
@@ -1138,7 +1241,8 @@ class Simulation:
         """Compute volume-weighted plastic strain avg."""
         if self.material_behavior in [
                 'elastoplastic_lh',
-                'elastoplastic_nlh']:
+                'elastoplastic_nlh',
+                'lou_zhang_yoon']:
             return (
                 (alpha_out[:, :, 0] * vol_weights)
                 .sum(dim=1))
@@ -1209,7 +1313,8 @@ class Simulation:
             if (self.is_save_avg_epbar
                     and self.material_behavior in [
                         'elastoplastic_lh',
-                        'elastoplastic_nlh']):
+                        'elastoplastic_nlh',
+                        'lou_zhang_yoon']):
                 self.simulation_data[
                     'epsilon_pl_eq'] = (
                     alpha_out_avg[-1])
@@ -1223,7 +1328,8 @@ class Simulation:
                 if (self.is_save_avg_epbar
                         and self.material_behavior
                         in ['elastoplastic_lh',
-                            'elastoplastic_nlh']):
+                            'elastoplastic_nlh',
+                            'lou_zhang_yoon']):
                     self.simulation_data[
                         'epsilon_pl_eq'][
                         idx_time] = (

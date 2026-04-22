@@ -170,8 +170,9 @@ def compute_strain_energy_density(
         # (num_increments, dim, dim) -> (num_increments, 1, dim, dim)
         def_grad = def_grad.unsqueeze(1)
 
-    if material_behavior in ['elastic', 'elastoplastic_nlh', 
-                             'elastoplastic_lh']:
+    if material_behavior in ['elastic', 'elastoplastic_nlh',
+                             'elastoplastic_lh',
+                             'lou_zhang_yoon']:
         # Compute strain tensor from deformation gradient
         # Small strain: epsilon = 0.5 * (F + F^T) - I
         I = torch.eye(dim, device=def_grad.device, dtype=def_grad.dtype)
