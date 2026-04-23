@@ -901,8 +901,8 @@ if __name__ == '__main__':
         edge_feature_type=(
             'edge_vector', 'relative_disp'),
         # fe_border=0,
-        patch_size_x=2,
-        patch_size_y=2,
+        patch_size_x=1,
+        patch_size_y=1,
         # patch_zones=[
         #     # Top-left 4x4: rows 0-3, cols 0-3
         #     {'region': (0, 4, 0, 4),
