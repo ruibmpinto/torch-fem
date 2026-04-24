@@ -949,6 +949,8 @@ if __name__ == '__main__':
         # fe_border=0,
         patch_size_x=1,
         patch_size_y=1,
+        is_adaptive_timestepping=False,
+        adaptive_max_subdiv=8,
         # patch_zones=[
         #     # Top-left 4x4: rows 0-3, cols 0-3
         #     {'region': (0, 4, 0, 4),
