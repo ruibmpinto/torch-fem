@@ -16,8 +16,7 @@ import psutil
 import scalene
 
 # Add graphorge to sys.path
-graphorge_path = str(pathlib.Path(__file__).parents[2] \
-                     / "graphorge" / "src")
+graphorge_path = str(pathlib.Path(__file__).parents[2] / "graphorge" / "src")
 if graphorge_path not in sys.path:
     sys.path.insert(0, graphorge_path)
 
@@ -80,7 +79,11 @@ def run_simulation_surrogate(
         patch_size_z=1,
         model_path=None, edge_type='all',
         edge_feature_type=('edge_vector',),
-        fe_border=0, patch_zones=None):
+        fe_border=0, patch_zones=None,
+        tangent_postproc='none',
+        spd_eps_rel=1e-6,
+        is_adaptive_timestepping=False,
+        adaptive_max_subdiv=8):
     """Run simulation with Graphorge surrogate model.
 
     Parameters
@@ -93,6 +96,30 @@ def run_simulation_surrogate(
         When None, a single zone is built from
         patch_size_x/y covering the full surrogate
         region (backward compatible).
+    tangent_postproc : {'none', 'sym', 'spd'}, default='none'
+        Per-patch post-processing applied to the surrogate
+        tangent K before assembly. 'sym' uses
+        0.5*(K + K.T); 'spd' symmetrises then projects
+        eigenvalues to max(lambda, eps), guaranteeing a
+        descent direction at the cost of local tangent
+        distortion.
+    spd_eps_rel : float, default=1e-6
+        Relative eigenvalue floor used only when
+        tangent_postproc='spd'. The absolute floor is
+        eps_rel * max(|lambda|), clamped below by 1e-10.
+    is_adaptive_timestepping : bool, default=False
+        If True, wrap the solve in a retry-and-subdivide
+        loop: on Newton-Raphson failure, re-solve with
+        2x, 4x, ... refinement of the load-factor
+        sequence (up to `adaptive_max_subdiv`) and
+        downsample results back to the original time
+        points. If False, perform a single solve; a
+        convergence failure propagates as an exception.
+    adaptive_max_subdiv : int, default=8
+        Maximum subdivision factor. The retry sequence
+        is the powers of 2 in [1, adaptive_max_subdiv].
+        Ignored when `is_adaptive_timestepping` is
+        False.
     """
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Monitor memory and time
@@ -219,27 +246,17 @@ def run_simulation_surrogate(
 
         def k_v(eps_pl):
             """Voce hardening component."""
-            return (
-                k_0
-                + q_v * (1.0 - torch.exp(-beta * eps_pl)))
+            return k_0 + q_v * (1.0 - torch.exp(-beta * eps_pl))
 
         def sigma_f(eps_pl):
             """Combined Swift-Voce hardening."""
-            return (
-                omega * k_s(eps_pl)
-                + (1.0 - omega) * k_v(eps_pl))
+            return omega * k_s(eps_pl) + (1.0 - omega) * k_v(eps_pl)
 
         def sigma_f_prime(eps_pl):
             """Derivative of Swift-Voce hardening."""
-            dks = (
-                a_s * n_sv
-                * (epsilon_0 + eps_pl)**(n_sv - 1.0))
-            dkv = (
-                q_v * beta
-                * torch.exp(-beta * eps_pl))
-            return (
-                omega * dks
-                + (1.0 - omega) * dkv)
+            dks = a_s * n_sv * (epsilon_0 + eps_pl)**(n_sv - 1.0)
+            dkv = q_v * beta * torch.exp(-beta * eps_pl)
+            return omega * dks + (1.0 - omega) * dkv
 
         if dim == 2:
             material = IsotropicPlasticityPlaneStrain(
@@ -275,18 +292,14 @@ def run_simulation_surrogate(
         surr_nx = mesh_nx - 2 * fe_border
         surr_ny = mesh_ny - 2 * fe_border
         patch_zones = [{
-            'region': (
-                fe_border, fe_border + surr_ny,
-                fe_border, fe_border + surr_nx),
-            'patch_size': (
-                patch_size_x, patch_size_y),
-        }]
+            'region': (fe_border, fe_border + surr_ny,
+                       fe_border, fe_border + surr_nx),
+            'patch_size': (patch_size_x, patch_size_y)}]
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Classify elements into patches (multi-zone)
     patch_id_counter = 0
     patch_resolution = {}
-    is_mat_patch = torch.full(
-        (num_elements,), -1, dtype=torch.int)
+    is_mat_patch = torch.full((num_elements,), -1, dtype=torch.int)
     for zone in patch_zones:
         r0, r1, c0, c1 = zone['region']
         psx, psy = zone['patch_size']
@@ -295,15 +308,12 @@ def run_simulation_surrogate(
         for elem_idx in range(num_elements):
             ei = elem_idx // mesh_nx
             ej = elem_idx % mesh_nx
-            if (r0 <= ei < r1
-                    and c0 <= ej < c1):
+            if r0 <= ei < r1 and c0 <= ej < c1:
                 pi = (ei - r0) // psy
                 pj = (ej - c0) // psx
-                pid = (patch_id_counter
-                       + pi * zone_nx + pj)
+                pid = patch_id_counter + pi * zone_nx + pj
                 is_mat_patch[elem_idx] = pid
-                patch_resolution[pid] = (
-                    psx, psy)
+                patch_resolution[pid] = (psx, psy)
         patch_id_counter += zone_nx * zone_ny
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Build model directory map from unique resolutions
@@ -317,44 +327,30 @@ def run_simulation_surrogate(
         model_directory_map = {}
         for res in unique_res:
             ps = f'{res[0]}x{res[1]}'
-            if material_behavior in (
-                    'elastoplastic',
-                    'elastoplastic_nlh'):
-                model_directory_map[res] = (
-                    os.path.join(
-                        surrogates_dir,
-                        'elastoplastic_nlh',
-                        ps, 'model'))
+            if material_behavior in ('elastoplastic', 'elastoplastic_nlh'):
+                model_directory_map[res] = os.path.join(
+                    surrogates_dir, 'elastoplastic_nlh', ps, 'model')
             else:
-                model_directory_map[res] = (
-                    os.path.join(
-                        surrogates_dir,
-                        material_behavior,
-                        ps, 'model'))
+                model_directory_map[res] = os.path.join(
+                    surrogates_dir, material_behavior, ps, 'model')
         patch_resolution_arg = patch_resolution
     else:
         # Single resolution -- pass str for compat
         res = list(unique_res)[0]
         ps = f'{res[0]}x{res[1]}'
-        if material_behavior in (
-                'elastoplastic',
-                'elastoplastic_nlh'):
+        if material_behavior in ('elastoplastic', 'elastoplastic_nlh'):
             model_directory_map = os.path.join(
-                surrogates_dir,
-                'elastoplastic_nlh', ps, 'model')
+                surrogates_dir, 'elastoplastic_nlh', ps, 'model')
         else:
             model_directory_map = os.path.join(
-                surrogates_dir,
-                material_behavior,
-                ps, 'model_rbmdelete')
+                surrogates_dir, material_behavior, ps,
+                'model_rbmdelete')
         patch_resolution_arg = None
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Build patch_elem_per_dim map
     if is_multi_res:
         patch_elem_per_dim_map = {
-            pid: list(res)
-            for pid, res
-            in patch_resolution.items()}
+            pid: list(res) for pid, res in patch_resolution.items()}
     else:
         res = list(unique_res)[0]
         patch_elem_per_dim_map = list(res)
@@ -366,19 +362,17 @@ def run_simulation_surrogate(
         patch_id = is_mat_patch[elem_idx].item()
         if patch_id < 0:
             continue
-        elem_nodes = elements[
-            elem_idx, :4].tolist()
+        elem_nodes = elements[elem_idx, :4].tolist()
         for node_id in elem_nodes:
             if node_id not in node_to_patches:
                 node_to_patches[node_id] = set()
             node_to_patches[node_id].add(patch_id)
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Collect nodes belonging to FE elements
     fe_nodes = set()
     for elem_idx in range(num_elements):
         if is_mat_patch[elem_idx].item() == -1:
-            for nid in elements[
-                    elem_idx, :4].tolist():
+            for nid in elements[elem_idx, :4].tolist():
                 fe_nodes.add(nid)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Identify external boundary nodes
@@ -388,25 +382,17 @@ def run_simulation_surrogate(
         if dim == 2:
             on_boundary = (
                 torch.abs(node_coord[0]) < tol
-                or torch.abs(
-                    node_coord[0] - 1.0) < tol
-                or torch.abs(
-                    node_coord[1]) < tol
-                or torch.abs(
-                    node_coord[1] - 1.0) < tol)
+                or torch.abs(node_coord[0] - 1.0) < tol
+                or torch.abs(node_coord[1]) < tol
+                or torch.abs(node_coord[1] - 1.0) < tol)
         elif dim == 3:
             on_boundary = (
                 torch.abs(node_coord[0]) < tol
-                or torch.abs(
-                    node_coord[0] - 1.0) < tol
-                or torch.abs(
-                    node_coord[1]) < tol
-                or torch.abs(
-                    node_coord[1] - 1.0) < tol
-                or torch.abs(
-                    node_coord[2]) < tol
-                or torch.abs(
-                    node_coord[2] - 1.0) < tol)
+                or torch.abs(node_coord[0] - 1.0) < tol
+                or torch.abs(node_coord[1]) < tol
+                or torch.abs(node_coord[1] - 1.0) < tol
+                or torch.abs(node_coord[2]) < tol
+                or torch.abs(node_coord[2] - 1.0) < tol)
         if on_boundary:
             external_boundary_nodes.add(i)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -422,19 +408,15 @@ def run_simulation_surrogate(
         if is_boundary:
             patch_boundary_nodes.append(node_id)
     patch_boundary_nodes = torch.tensor(
-        sorted(patch_boundary_nodes),
-        dtype=torch.long)
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        sorted(patch_boundary_nodes), dtype=torch.long)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Internal patch nodes: in a patch, not boundary,
     # not part of any FE element
     all_patch_nodes = set(node_to_patches.keys())
     patch_internal_nodes = (
-        all_patch_nodes
-        - set(patch_boundary_nodes.tolist())
-        - fe_nodes)
+        all_patch_nodes - set(patch_boundary_nodes.tolist()) - fe_nodes)
     patch_internal_nodes = torch.tensor(
-        sorted(list(patch_internal_nodes)),
-        dtype=torch.long)
+        sorted(list(patch_internal_nodes)), dtype=torch.long)
 
     # Build patch_boundary_nodes_dict:
     # patch_id -> boundary node indices
@@ -442,17 +424,13 @@ def run_simulation_surrogate(
     n_patches = patch_id_counter
     for patch_id in range(n_patches):
         patch_boundary_set = set()
-        for node_id, patches in (
-                node_to_patches.items()):
+        for node_id, patches in node_to_patches.items():
             if patch_id in patches:
                 if (len(patches) > 1
-                        or node_id
-                        in external_boundary_nodes
+                        or node_id in external_boundary_nodes
                         or node_id in fe_nodes):
-                    patch_boundary_set.add(
-                        node_id)
-        patch_boundary_nodes_dict[
-            patch_id] = torch.tensor(
+                    patch_boundary_set.add(node_id)
+        patch_boundary_nodes_dict[patch_id] = torch.tensor(
             sorted(list(patch_boundary_set)),
             dtype=torch.long)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -495,10 +473,9 @@ def run_simulation_surrogate(
     # Profile solve method
     profiler_solve = cProfile.Profile()
     profiler_solve.enable()
-    u_ref, f_ref, _, _, state_ref, res_hist_ref = \
-        domain.solve(
-            increments=increments_ref, rtol=1e-8,
-            verbose=True, return_resnorm=True)
+    u_ref, f_ref, _, _, state_ref, res_hist_ref = domain.solve(
+        increments=increments_ref, rtol=1e-8,
+        verbose=True, return_resnorm=True)
     profiler_solve.disable()
     print("\n=== SOLVE METHOD PROFILE ===")
     stats_solve = pstats.Stats(profiler_solve)
@@ -533,8 +510,7 @@ def run_simulation_surrogate(
         f"mesh_{mesh_str}", f"patch_{patch_str}",
         f"n_time_inc_{n_increments}")
     os.makedirs(output_dir, exist_ok=True)
-    plot_path = os.path.join(
-        output_dir, "disp_field_ref.png")
+    plot_path = os.path.join(output_dir, "disp_field_ref.png")
     plt.savefig(plot_path)
     plt.close()
     print(f"Reference solution saved to {plot_path}")
@@ -544,39 +520,29 @@ def run_simulation_surrogate(
         'displacements': u_ref.detach().cpu().numpy(),
         'forces': f_ref.detach().cpu().numpy(),
     }
-    ref_file = os.path.join(
-        output_dir, "results_reference.pkl")
+    ref_file = os.path.join(output_dir, "results_reference.pkl")
     with open(ref_file, 'wb') as fh:
         pkl.dump(results_ref, fh)
     print(f"Reference results saved to {ref_file}")
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Save reference residual and state to subdirectory
-    ref_results_dir = os.path.join(
-        output_dir, 'reference_results')
+    ref_results_dir = os.path.join(output_dir, 'reference_results')
     os.makedirs(ref_results_dir, exist_ok=True)
     # Save residual history as CSV files
     for inc, norms in res_hist_ref.items():
         res0 = norms[0] if norms[0] > 0 else 1.0
         rows = np.column_stack((
-            np.arange(len(norms)),
-            np.array(norms),
+            np.arange(len(norms)), np.array(norms),
             np.array(norms) / res0))
         np.savetxt(
-            os.path.join(
-                ref_results_dir,
-                f'residual_inc{inc}.csv'),
-            rows,
-            delimiter=',',
-            header='iteration,absolute,relative',
-            comments='')
-    print(f'Reference residuals saved to '
-          f'{ref_results_dir}')
+            os.path.join(ref_results_dir, f'residual_inc{inc}.csv'),
+            rows, delimiter=',',
+            header='iteration,absolute,relative', comments='')
+    print(f'Reference residuals saved to {ref_results_dir}')
     # Save equivalent plastic strain as pkl
-    epbar_file = os.path.join(
-        ref_results_dir, 'epbar.pkl')
+    epbar_file = os.path.join(ref_results_dir, 'epbar.pkl')
     with open(epbar_file, 'wb') as fh:
-        pkl.dump(
-            state_ref.detach().cpu().numpy(), fh)
+        pkl.dump(state_ref.detach().cpu().numpy(), fh)
     print(f'Reference epbar saved to {epbar_file}')
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Save reference constraint state before locking internal
@@ -592,8 +558,7 @@ def run_simulation_surrogate(
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Solver
     # Create more increments for elastoplastic simulation
-    if material_behavior in (
-            'elastoplastic', 'elastoplastic_nlh'):
+    if material_behavior in ('elastoplastic', 'elastoplastic_nlh'):
         increments = torch.linspace(0.0, 1.0, 51)
         is_stepwise = True
     else:
@@ -669,39 +634,70 @@ def run_simulation_surrogate(
         mesh_str += f'x{mesh_nz}'
     n_increments = len(increments) - 1
     output_dir = os.path.join(
-        results_base, material_behavior, f'{dim}d',
-        element_type, f'mesh_{mesh_str}',
-        f'patch_{patch_str}',
+        results_base, material_behavior, f'{dim}d', element_type,
+        f'mesh_{mesh_str}', f'patch_{patch_str}',
         f'n_time_inc_{n_increments}')
     os.makedirs(output_dir, exist_ok=True)
-    stiffness_dir = os.path.join(
-        output_dir, 'stiffness')
+    stiffness_dir = os.path.join(output_dir, 'stiffness')
     os.makedirs(stiffness_dir, exist_ok=True)
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    u, f, _, _, _, residual_history = \
-        domain.solve_matpatch(
-        is_mat_patch=is_mat_patch,
-        increments=increments,
-        max_iter=100,
-        rtol=1e-8,
-        verbose=True,
-        return_intermediate=True,
-        return_volumes=False,
-        return_resnorm=True,
-        is_stepwise=is_stepwise,
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Build base solve kwargs shared by all retry attempts
+    solve_kwargs = dict(
+        is_mat_patch=is_mat_patch, max_iter=100, rtol=1e-8,
+        verbose=True, return_intermediate=True, return_volumes=False,
+        return_resnorm=True, is_stepwise=is_stepwise,
         model_directory=model_directory_map,
-        patch_boundary_nodes=
-            patch_boundary_nodes_dict,
-        patch_elem_per_dim=
-            patch_elem_per_dim_map,
-        patch_resolution=
-            patch_resolution_arg,
-        edge_type=edge_type,
-        edge_feature_type=edge_feature_type,
-        is_export_stiffness=True,
-        stiffness_output_dir=stiffness_dir,
+        patch_boundary_nodes=patch_boundary_nodes_dict,
+        patch_elem_per_dim=patch_elem_per_dim_map,
+        patch_resolution=patch_resolution_arg,
+        edge_type=edge_type, edge_feature_type=edge_feature_type,
+        is_export_stiffness=True, stiffness_output_dir=stiffness_dir,
         patch_size_label=patch_str,
-    )
+        tangent_postproc=tangent_postproc, spd_eps_rel=spd_eps_rel)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Solve (with optional adaptive sub-increment)
+    if not is_adaptive_timestepping:
+        u, f, _, _, _, residual_history = domain.solve_matpatch(
+            increments=increments, **solve_kwargs)
+    else:
+        subdiv_seq = []
+        k_sub = 1
+        while k_sub <= adaptive_max_subdiv:
+            subdiv_seq.append(k_sub)
+            k_sub *= 2
+        last_exc = None
+        results = None
+        used_subdiv = 1
+        for n_subdiv in subdiv_seq:
+            if n_subdiv == 1:
+                incr = increments
+            else:
+                refined = [increments[0]]
+                for j in range(len(increments) - 1):
+                    a, b = increments[j], increments[j + 1]
+                    for s in range(1, n_subdiv + 1):
+                        refined.append(a + (b - a) * s / n_subdiv)
+                incr = torch.tensor(refined, dtype=increments.dtype)
+            try:
+                results = domain.solve_matpatch(
+                    increments=incr, **solve_kwargs)
+                used_subdiv = n_subdiv
+                if n_subdiv > 1:
+                    print(f'  converged with {n_subdiv}x '
+                          f'subincrementation')
+                break
+            except Exception as excp:
+                last_exc = excp
+                print(f'  {n_subdiv}x failed: {excp}')
+        if results is None:
+            raise RuntimeError(
+                f'Newton-Raphson failed up to {subdiv_seq[-1]}x '
+                f'subincrementation: {last_exc}')
+        if used_subdiv > 1:
+            results = tuple(
+                r[::used_subdiv] if isinstance(r, torch.Tensor) else r
+                for r in results)
+        u, f, _, _, _, residual_history = results
     profiler_matpatch.disable()
     print("\n=== SOLVE_MATPATCH METHOD PROFILE ===")
     stats_matpatch = pstats.Stats(profiler_matpatch)
@@ -722,17 +718,12 @@ def run_simulation_surrogate(
     for inc, norms in residual_history.items():
         res0 = norms[0] if norms[0] > 0 else 1.0
         rows = np.column_stack((
-            np.arange(len(norms)),
-            np.array(norms),
+            np.arange(len(norms)), np.array(norms),
             np.array(norms) / res0))
         np.savetxt(
-            os.path.join(
-                residual_dir,
-                f'residual_inc{inc}.csv'),
-            rows,
-            delimiter=',',
-            header='iteration,absolute,relative',
-            comments='')
+            os.path.join(residual_dir, f'residual_inc{inc}.csv'),
+            rows, delimiter=',',
+            header='iteration,absolute,relative', comments='')
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Save results
     results = {
@@ -780,13 +771,9 @@ def run_simulation_surrogate(
     domain.plot(
         u=u_diff,
         node_property=torch.norm(u_diff, dim=1),
-        title=r'$||\mathbf{u}_{srg} - '
-              r'\mathbf{u}_{ref}||_{2}$',
-        colorbar=True,
-        cmap='viridis',
-        vmin=vmin_ref,
-        vmax=vmax_ref
-    )
+        title=r'$||\mathbf{u}_{srg} - \mathbf{u}_{ref}||_{2}$',
+        colorbar=True, cmap='viridis',
+        vmin=vmin_ref, vmax=vmax_ref)
 
     plot_path = os.path.join(output_dir, "disp_field_diff.png")
     plt.savefig(plot_path)
@@ -806,12 +793,9 @@ def run_simulation_surrogate(
         u=u_final,
         node_property=torch.norm(f_final, dim=1),
         title=r'Surrogate: $||\mathbf{f}||_{2}$',
-        colorbar=True,
-        cmap='plasma',
-        vmin=vmin_f,
-        vmax=vmax_f)
-    plot_path = os.path.join(
-        output_dir, 'force_field_srg.png')
+        colorbar=True, cmap='plasma',
+        vmin=vmin_f, vmax=vmax_f)
+    plot_path = os.path.join(output_dir, 'force_field_srg.png')
     plt.savefig(plot_path)
     plt.close()
 
@@ -826,12 +810,9 @@ def run_simulation_surrogate(
         u=u_ref_final,
         node_property=torch.norm(f_ref_final, dim=1),
         title=r'Reference: $||\mathbf{f}||_{2}$',
-        colorbar=True,
-        cmap='plasma',
-        vmin=vmin_f,
-        vmax=vmax_f)
-    plot_path = os.path.join(
-        output_dir, 'force_field_ref.png')
+        colorbar=True, cmap='plasma',
+        vmin=vmin_f, vmax=vmax_f)
+    plot_path = os.path.join(output_dir, 'force_field_ref.png')
     plt.savefig(plot_path)
     plt.close()
 
@@ -845,9 +826,7 @@ def run_simulation_surrogate(
         u=u_diff,
         node_property=torch.norm(f_diff, dim=1),
         title=r'$||\mathbf{f}_{pred} - \mathbf{f}_{ref}||_{2}$',
-        colorbar=True,
-        cmap='viridis'
-    )
+        colorbar=True, cmap='viridis')
 
     plot_path = os.path.join(output_dir, "force_field_difference.png")
     plt.savefig(plot_path)
@@ -858,21 +837,15 @@ def run_simulation_surrogate(
         nodes=domain.nodes,
         elements=domain.elements,
         u_surrogate=u[-1],
-        patch_boundary_nodes_dict=
-            patch_boundary_nodes_dict,
-        output_path=os.path.join(
-            output_dir,
-            'boundary_disp_overlay.png'))
+        patch_boundary_nodes_dict=patch_boundary_nodes_dict,
+        output_path=os.path.join(output_dir, 'boundary_disp_overlay.png'))
 
     plot_boundary_panels(
         nodes=domain.nodes,
         elements=domain.elements,
         u_surrogate=u[-1],
-        patch_boundary_nodes_dict=
-            patch_boundary_nodes_dict,
-        output_path=os.path.join(
-            output_dir,
-            'boundary_disp_panels.png'),
+        patch_boundary_nodes_dict=patch_boundary_nodes_dict,
+        output_path=os.path.join(output_dir, 'boundary_disp_panels.png'),
         u_reference=u_ref[-1])
 
     plot_boundary_error_overlay(
@@ -880,11 +853,8 @@ def run_simulation_surrogate(
         elements=domain.elements,
         u_surrogate=u[-1],
         u_reference=u_ref[-1],
-        patch_boundary_nodes_dict=
-            patch_boundary_nodes_dict,
-        output_path=os.path.join(
-            output_dir,
-            'boundary_error_overlay.png'))
+        patch_boundary_nodes_dict=patch_boundary_nodes_dict,
+        output_path=os.path.join(output_dir, 'boundary_error_overlay.png'))
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
     # Multi-resolution: 8x8 mesh, no FE border
@@ -898,11 +868,14 @@ if __name__ == '__main__':
         mesh_nx=10,
         mesh_ny=10,
         edge_type='all',
-        edge_feature_type=(
-            'edge_vector', 'relative_disp'),
+        edge_feature_type=('edge_vector', 'relative_disp'),
         # fe_border=0,
-        patch_size_x=1,
-        patch_size_y=1,
+        patch_size_x=5,
+        patch_size_y=5,
+        # {'none', 'sym', 'spd'}
+        tangent_postproc='spd',
+        # relative eigenvalue floor
+        spd_eps_rel=1e-6,
         # patch_zones=[
         #     # Top-left 4x4: rows 0-3, cols 0-3
         #     {'region': (0, 4, 0, 4),

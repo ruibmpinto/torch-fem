@@ -1,5 +1,6 @@
 import copy
 import cProfile
+import csv
 import functools
 import os
 import pstats
@@ -37,6 +38,50 @@ if is_import_graphorge:
         get_elem_size_dims,
         get_mesh_connected_nodes,
     )
+
+
+def _project_spd(k_dense, eps_rel=1e-6, eps_abs=1e-10):
+    """Project dense K to nearest SPD matrix.
+
+    Symmetrises, eigendecomposes, clamps eigenvalues to a positive
+    floor, reconstructs. Operates on a detached tensor — no autograd.
+
+    Parameters
+    ----------
+    k_dense : torch.Tensor
+        Square dense matrix of shape (n, n).
+    eps_rel : float, default=1e-6
+        Relative floor fraction applied to the maximum absolute
+        eigenvalue.
+    eps_abs : float, default=1e-10
+        Absolute floor used when eps_rel * max(|lambda|) underflows.
+
+    Returns
+    -------
+    k_spd : torch.Tensor
+        Projected matrix, same dtype and device as k_dense.
+    diag : dict
+        Keys: 'n_neg', 'lambda_min', 'lambda_max', 'frob_ratio'.
+        'frob_ratio' is ||k_spd - k_sym||_F / ||k_sym||_F.
+    """
+    k_sym = 0.5 * (k_dense + k_dense.T)
+    lam, q = torch.linalg.eigh(k_sym)
+    rel_floor = (eps_rel * lam.abs().max()).item()
+    floor = max(rel_floor, eps_abs)
+    lam_clamped = torch.clamp(lam, min=floor)
+    k_spd = (q * lam_clamped.unsqueeze(0)) @ q.T
+    sym_norm = torch.linalg.norm(k_sym).item()
+    if sym_norm > 0.0:
+        frob_ratio = torch.linalg.norm(k_spd - k_sym).item() / sym_norm
+    else:
+        frob_ratio = 0.0
+    diag = {
+        'n_neg': int((lam < 0.0).sum().item()),
+        'lambda_min': float(lam.min().item()),
+        'lambda_max': float(lam.max().item()),
+        'frob_ratio': float(frob_ratio),
+    }
+    return k_spd, diag
 
 
 class FEM(ABC):
@@ -1390,6 +1435,8 @@ class FEM(ABC):
         model_cache: dict = None,
         patch_resolution: dict = None,
         is_jacfwd_parallel: bool = False,
+        tangent_postproc: str = 'none',
+        spd_eps_rel: float = 1e-6,
     ) -> tuple[Tensor, Tensor]:
         """Perform surrogate integration using Graphorge material patch model.
 
@@ -1426,6 +1473,15 @@ class FEM(ABC):
             patch. Internal nodes are constrained to zero displacement and do
             not contribute to stiffness or forces.
         """
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Validate tangent_postproc and reset per-call SPD diagnostics.
+        # Populated when tangent_postproc == 'spd'; read by
+        # solve_matpatch after each NR iteration for CSV dump.
+        if tangent_postproc not in ('none', 'sym', 'spd'):
+            raise ValueError(
+                f"tangent_postproc must be one of "
+                f"{{'none', 'sym', 'spd'}}, got {tangent_postproc!r}.")
+        self._last_spd_diagnostics = {}
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize patch-specific hidden states output
         hidden_states_out = {}
@@ -1638,6 +1694,17 @@ class FEM(ABC):
                 # Restore hidden_states_trial to the values from the
                 # force eval so the stepwise state carry is correct.
                 hidden_states_trial = _hs_trial_saved
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Apply tangent post-processing. The surrogate tangent is
+            # asymmetric and indefinite; 'spd' projects to the nearest
+            # SPD matrix so the Newton step is a descent direction.
+            if tangent_postproc == 'spd':
+                k_boundary, spd_diag = _project_spd(
+                    k_boundary.detach(), eps_rel=spd_eps_rel)
+                self._last_spd_diagnostics[int(idx_patch)] = spd_diag
+            elif tangent_postproc == 'sym':
+                k_boundary = (
+                    0.5 * (k_boundary + k_boundary.T)).detach()
             # Store per-patch boundary stiffness
             patch_stiffness_dict[idx_patch] = \
                 k_boundary.detach().clone()
@@ -1728,6 +1795,8 @@ class FEM(ABC):
         stiffness_output_dir: str | None = None,
         patch_size_label: str | None = None,
         is_jacfwd_parallel: bool = False,
+        tangent_postproc: str = 'none',
+        spd_eps_rel: float = 1e-6,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | tuple[
@@ -1930,6 +1999,10 @@ class FEM(ABC):
             # Initialize residual norm list for this increment if requested
             if return_resnorm:
                 residual_history[n] = []
+            # Per-increment SPD projection diagnostics history.
+            # Populated when tangent_postproc == 'spd'; one entry
+            # per Newton iteration.
+            self._spd_iter_history = []
             # Newton-Raphson iterations
             for i in range(max_iter):
                 du[con] = DU[con]
@@ -1963,7 +2036,10 @@ class FEM(ABC):
                         patch_resolution=
                             patch_resolution,
                         is_jacfwd_parallel=
-                            is_jacfwd_parallel)
+                            is_jacfwd_parallel,
+                        tangent_postproc=
+                            tangent_postproc,
+                        spd_eps_rel=spd_eps_rel)
                     if is_stepwise:
                         surr_kwargs[
                             'hidden_states'] = (
@@ -1980,6 +2056,11 @@ class FEM(ABC):
                             self \
                             .surrogate_integrate_material(
                             **surr_kwargs)
+                    # Snapshot per-iteration SPD diagnostics.
+                    if (tangent_postproc == 'spd'
+                            and self._last_spd_diagnostics):
+                        self._spd_iter_history.append(
+                            self._last_spd_diagnostics)
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Combine FE and surrogate contributions
                 if has_fe and has_surr:
@@ -2026,7 +2107,6 @@ class FEM(ABC):
                     # Save converged per-patch stiffness
                     if (is_export_stiffness
                             and stiffness_output_dir):
-                        import os
                         for pid, k_mat in \
                                 patch_k_dict.items():
                             fname = (
@@ -2061,6 +2141,27 @@ class FEM(ABC):
                     cached_solve,
                     update_cache,
                 )
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Dump SPD projection diagnostics (per iteration) for
+            # this increment, whether it converged or not.
+            if (tangent_postproc == 'spd'
+                    and stiffness_output_dir
+                    and self._spd_iter_history):
+                diag_path = os.path.join(
+                    stiffness_output_dir,
+                    f'spd_diag_{patch_size_label}_inc{n}.csv')
+                with open(diag_path, 'w', newline='') as fh:
+                    w = csv.writer(fh)
+                    w.writerow([
+                        'iter', 'patch_id', 'n_neg', 'lambda_min',
+                        'lambda_max', 'frob_ratio'])
+                    for it_idx, snap in enumerate(self._spd_iter_history):
+                        for pid, d in sorted(snap.items()):
+                            w.writerow([
+                                it_idx + 1, pid, d['n_neg'],
+                                f"{d['lambda_min']:.6e}",
+                                f"{d['lambda_max']:.6e}",
+                                f"{d['frob_ratio']:.6e}"])
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Raise an Exception if the model did not converge
             if res_norm > rtol * res_norm0 and res_norm > atol:
