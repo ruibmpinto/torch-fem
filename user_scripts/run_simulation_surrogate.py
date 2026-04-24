@@ -82,7 +82,8 @@ def run_simulation_surrogate(
         edge_feature_type=('edge_vector',),
         fe_border=0, patch_zones=None,
         is_adaptive_timestepping=False,
-        adaptive_max_subdiv=8):
+        adaptive_max_subdiv=8,
+        nr_tangent='surrogate'):
     """Run simulation with Graphorge surrogate model.
 
     Parameters
@@ -107,6 +108,13 @@ def run_simulation_surrogate(
         Maximum subdivision factor. The retry sequence is
         the powers of 2 in [1, adaptive_max_subdiv]. Ignored
         when `is_adaptive_timestepping` is False.
+    nr_tangent : {'surrogate', 'elastic_analytic'}, default='surrogate'
+        Which tangent to use in the Newton step. 'surrogate' uses
+        the GNN Jacobian (possibly SPD-projected). 'elastic_analytic'
+        uses a precomputed linear-elastic stiffness on the same
+        mesh (modified Newton); the residual still uses the
+        surrogate force. Linear convergence expected; quadratic
+        lost.
     """
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Monitor memory and time
@@ -692,6 +700,24 @@ def run_simulation_surrogate(
         output_dir, 'stiffness')
     os.makedirs(stiffness_dir, exist_ok=True)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Precompute analytic linear-elastic tangent on twin domain
+    # (used only when nr_tangent == 'elastic_analytic'). For linear
+    # elasticity K is displacement-independent, so assemble once.
+    K_elastic = None
+    if nr_tangent == 'elastic_analytic':
+        if dim == 2:
+            twin_mat = IsotropicElasticityPlaneStrain(
+                E=e_young, nu=nu)
+            twin_domain = Planar(
+                nodes.clone(), elements.clone(), twin_mat)
+        else:
+            twin_mat = IsotropicElasticity3D(E=e_young, nu=nu)
+            twin_domain = Solid(
+                nodes.clone(), elements.clone(), twin_mat)
+        K_elastic = twin_domain.assemble_linear_elastic_k()
+        print(f'[K_elastic] nnz={K_elastic._nnz()}, '
+              f'shape={tuple(K_elastic.shape)}')
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Build base solve kwargs shared by all retry attempts
     solve_kwargs = dict(
         is_mat_patch=is_mat_patch, max_iter=100, rtol=1e-8,
@@ -703,7 +729,8 @@ def run_simulation_surrogate(
         patch_resolution=patch_resolution_arg,
         edge_type=edge_type, edge_feature_type=edge_feature_type,
         is_export_stiffness=True, stiffness_output_dir=stiffness_dir,
-        patch_size_label=patch_str)
+        patch_size_label=patch_str,
+        nr_tangent=nr_tangent, K_elastic=K_elastic)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Solve (with optional adaptive sub-increment)
     if not is_adaptive_timestepping:
@@ -947,8 +974,12 @@ if __name__ == '__main__':
         edge_feature_type=(
             'edge_vector', 'relative_disp'),
         # fe_border=0,
-        patch_size_x=1,
-        patch_size_y=1,
+        patch_size_x=5,
+        patch_size_y=5,
+        is_adaptive_timestepping=False,
+        adaptive_max_subdiv=8,
+        # {'surrogate', 'elastic_analytic'}
+        nr_tangent='elastic_analytic',
         # patch_zones=[
         #     # Top-left 4x4: rows 0-3, cols 0-3
         #     {'region': (0, 4, 0, 4),

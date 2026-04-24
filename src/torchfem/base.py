@@ -457,6 +457,47 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return K_fe, F_fe
     # -----------------------------------------------------------------
+    def assemble_linear_elastic_k(self):
+        """Assemble the linear-elastic global sparse stiffness K.
+
+        Evaluates the current material's tangent at zero
+        displacement, zero stress, zero state. For a linear-elastic
+        material this yields the constant elastic tangent. Returns
+        unconstrained sparse K of shape (n_dofs, n_dofs).
+
+        Returns
+        -------
+        K_elastic : torch.sparse_coo_tensor
+            Coalesced sparse stiffness.
+
+        Notes
+        -----
+        Reuses `_integrate_fe_subset` over all elements with an
+        identity deformation gradient and zero du/de0. The material
+        must be linear-elastic for the returned K to be constant
+        across NR iterations.
+        """
+        N = 2
+        u0 = torch.zeros(N, self.n_nod, self.n_dim)
+        defgrad0 = torch.zeros(
+            N, self.n_int, self.n_elem,
+            self.n_stress, self.n_stress)
+        defgrad0[:, :, :, :, :] = torch.eye(self.n_stress)
+        stress0 = torch.zeros_like(defgrad0)
+        state0 = torch.zeros(
+            N, self.n_int, self.n_elem, self.material.n_state)
+        du0 = torch.zeros(self.n_dofs)
+        de0 = torch.zeros_like(self.ext_strain)
+        all_ix = torch.arange(self.n_elem)
+        # _integrate_fe_subset saves/restores self.K, so ensure
+        # it exists even if solve_matpatch has not initialised it.
+        if not hasattr(self, 'K'):
+            self.K = torch.empty(0)
+        k_sparse, _ = self._integrate_fe_subset(
+            all_ix, u0, defgrad0, stress0, state0,
+            1, du0, de0, nlgeom=False)
+        return k_sparse.coalesce()
+    # -----------------------------------------------------------------
     def _load_Graphorge_model(self, model_directory: str,
                               device_type: str = 'cpu'):
         """Load and configure Graphorge material patch model.
@@ -1728,6 +1769,8 @@ class FEM(ABC):
         stiffness_output_dir: str | None = None,
         patch_size_label: str | None = None,
         is_jacfwd_parallel: bool = False,
+        nr_tangent: str = 'surrogate',
+        K_elastic: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | tuple[
@@ -1790,6 +1833,16 @@ class FEM(ABC):
         if is_mat_patch.shape[0] != self.n_elem:
             raise ValueError(f'is_mat_patch shape {is_mat_patch.shape} ' + \
                              f'must match number of elements {self.n_elem}')
+        # Validate nr_tangent / K_elastic
+        if nr_tangent not in ('surrogate', 'elastic_analytic'):
+            raise ValueError(
+                f"nr_tangent must be one of "
+                f"{{'surrogate', 'elastic_analytic'}}, "
+                f"got {nr_tangent!r}.")
+        if nr_tangent == 'elastic_analytic' and K_elastic is None:
+            raise ValueError(
+                "nr_tangent='elastic_analytic' requires K_elastic "
+                "to be a precomputed sparse COO tensor.")
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Number of increments
         N = len(increments)
@@ -1992,6 +2045,12 @@ class FEM(ABC):
                 else:
                     K_combined = K_surr
                     F_int = F_surr
+                # Override tangent with analytic elastic stiffness
+                # (modified Newton). Residual keeps the surrogate
+                # force, so equilibrium is still measured against
+                # the GNN prediction.
+                if nr_tangent == 'elastic_analytic':
+                    K_combined = K_elastic
                 # Apply constraint elimination
                 self.K = (
                     self._apply_constraints_sparse(
