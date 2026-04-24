@@ -80,7 +80,9 @@ def run_simulation_surrogate(
         patch_size_z=1,
         model_path=None, edge_type='all',
         edge_feature_type=('edge_vector',),
-        fe_border=0, patch_zones=None):
+        fe_border=0, patch_zones=None,
+        is_adaptive_timestepping=False,
+        adaptive_max_subdiv=8):
     """Run simulation with Graphorge surrogate model.
 
     Parameters
@@ -93,6 +95,18 @@ def run_simulation_surrogate(
         When None, a single zone is built from
         patch_size_x/y covering the full surrogate
         region (backward compatible).
+    is_adaptive_timestepping : bool, default=False
+        If True, wrap the solve in a retry-and-subdivide
+        loop: on Newton-Raphson failure, re-solve with 2x,
+        4x, ... refinement of the load-factor sequence (up
+        to `adaptive_max_subdiv`) and downsample tensor
+        results back to the original time points. If False,
+        perform a single solve; a convergence failure
+        propagates as an exception.
+    adaptive_max_subdiv : int, default=8
+        Maximum subdivision factor. The retry sequence is
+        the powers of 2 in [1, adaptive_max_subdiv]. Ignored
+        when `is_adaptive_timestepping` is False.
     """
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Monitor memory and time
@@ -677,31 +691,63 @@ def run_simulation_surrogate(
     stiffness_dir = os.path.join(
         output_dir, 'stiffness')
     os.makedirs(stiffness_dir, exist_ok=True)
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    u, f, _, _, _, residual_history = \
-        domain.solve_matpatch(
-        is_mat_patch=is_mat_patch,
-        increments=increments,
-        max_iter=100,
-        rtol=1e-8,
-        verbose=True,
-        return_intermediate=True,
-        return_volumes=False,
-        return_resnorm=True,
-        is_stepwise=is_stepwise,
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Build base solve kwargs shared by all retry attempts
+    solve_kwargs = dict(
+        is_mat_patch=is_mat_patch, max_iter=100, rtol=1e-8,
+        verbose=True, return_intermediate=True, return_volumes=False,
+        return_resnorm=True, is_stepwise=is_stepwise,
         model_directory=model_directory_map,
-        patch_boundary_nodes=
-            patch_boundary_nodes_dict,
-        patch_elem_per_dim=
-            patch_elem_per_dim_map,
-        patch_resolution=
-            patch_resolution_arg,
-        edge_type=edge_type,
-        edge_feature_type=edge_feature_type,
-        is_export_stiffness=True,
-        stiffness_output_dir=stiffness_dir,
-        patch_size_label=patch_str,
-    )
+        patch_boundary_nodes=patch_boundary_nodes_dict,
+        patch_elem_per_dim=patch_elem_per_dim_map,
+        patch_resolution=patch_resolution_arg,
+        edge_type=edge_type, edge_feature_type=edge_feature_type,
+        is_export_stiffness=True, stiffness_output_dir=stiffness_dir,
+        patch_size_label=patch_str)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Solve (with optional adaptive sub-increment)
+    if not is_adaptive_timestepping:
+        u, f, _, _, _, residual_history = domain.solve_matpatch(
+            increments=increments, **solve_kwargs)
+    else:
+        subdiv_seq = []
+        k_sub = 1
+        while k_sub <= adaptive_max_subdiv:
+            subdiv_seq.append(k_sub)
+            k_sub *= 2
+        last_exc = None
+        results = None
+        used_subdiv = 1
+        for n_subdiv in subdiv_seq:
+            if n_subdiv == 1:
+                incr = increments
+            else:
+                refined = [increments[0]]
+                for j in range(len(increments) - 1):
+                    a, b = increments[j], increments[j + 1]
+                    for s in range(1, n_subdiv + 1):
+                        refined.append(a + (b - a) * s / n_subdiv)
+                incr = torch.tensor(refined, dtype=increments.dtype)
+            try:
+                results = domain.solve_matpatch(
+                    increments=incr, **solve_kwargs)
+                used_subdiv = n_subdiv
+                if n_subdiv > 1:
+                    print(f'  converged with {n_subdiv}x '
+                          f'subincrementation')
+                break
+            except Exception as excp:
+                last_exc = excp
+                print(f'  {n_subdiv}x failed: {excp}')
+        if results is None:
+            raise RuntimeError(
+                f'Newton-Raphson failed up to {subdiv_seq[-1]}x '
+                f'subincrementation: {last_exc}')
+        if used_subdiv > 1:
+            results = tuple(
+                r[::used_subdiv] if isinstance(r, torch.Tensor) else r
+                for r in results)
+        u, f, _, _, _, residual_history = results
     profiler_matpatch.disable()
     print("\n=== SOLVE_MATPATCH METHOD PROFILE ===")
     stats_matpatch = pstats.Stats(profiler_matpatch)
