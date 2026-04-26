@@ -650,6 +650,7 @@ class FEM(ABC):
         device: str | None = None,
         return_intermediate: bool = True,
         aggregate_integration_points: bool = True,
+        aggregate_state: bool = None,
         use_cached_solve: bool = False,
         nlgeom: bool = False,
         return_volumes: bool = False,
@@ -817,9 +818,12 @@ class FEM(ABC):
                 volumes[n] = self.integrate_field()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Aggregate integration points as mean
+        if aggregate_state is None:
+            aggregate_state = aggregate_integration_points
         if aggregate_integration_points:
             defgrad = defgrad.mean(dim=1)
             stress = stress.mean(dim=1)
+        if aggregate_state:
             state = state.mean(dim=1)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Squeeze outputs

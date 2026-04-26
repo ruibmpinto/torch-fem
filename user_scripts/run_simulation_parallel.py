@@ -151,16 +151,18 @@ def run_parallel_simulations(
     return results
 # =============================================================================
 if __name__ == '__main__':
-    filepath = '/Volumes/Expansion/material_patches_data/'
+    input_path = '/Volumes/Expansion/material_patches_data/'
+    output_path = '/Volumes/T7/material_patches/linear_bcs/'
 
     configs = []
-    for idx in range(1648, 1670):
+    for idx in range(0, 5000):
         configs.append({
             'element_type': 'quad4',
             'material_behavior': 'elastoplastic_nlh',
             'num_increments': 100,
             'patch_idx': idx,
-            'filepath': filepath,
+            'input_path': input_path,
+            'output_path': output_path,
             'mesh_nx': 8,
             'mesh_ny': 8,
             'mesh_nz': 1,

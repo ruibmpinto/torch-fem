@@ -304,9 +304,11 @@ class Simulation:
         is_analytical_tangent=True,
         is_adaptive_timestepping=False,
         adaptive_max_subdiv=8,
-        filepath='/Users/rbarreira/Desktop/'
-                 'machine_learning/'
-                 'material_patches/_data/'
+        input_path='/Users/rbarreira/Desktop/'
+                   'machine_learning/'
+                   'material_patches/_data/',
+        output_path='/Volumes/T7/material_patches/'
+                    'linear_bcs/',
     ):
         """Initialize simulation parameters.
 
@@ -368,8 +370,12 @@ class Simulation:
             disables refinement). Must be an integer
             >= 1. Ignored when
             `is_adaptive_timestepping` is False.
-        filepath : str
+        input_path : str
             Base path to material patch input data.
+        output_path : str
+            Base path under which simulation outputs are
+            written (the `_data/...` directory tree is
+            created beneath this prefix).
         """
         self.element_type = element_type
         self.material_behavior = material_behavior
@@ -391,7 +397,8 @@ class Simulation:
                 f'adaptive_max_subdiv must be >= 1, '
                 f'got {adaptive_max_subdiv}.')
         self.adaptive_max_subdiv = adaptive_max_subdiv
-        self.filepath = filepath
+        self.input_path = input_path
+        self.output_path = output_path
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Determine element order and dimension
         self._element_properties()
@@ -427,15 +434,11 @@ class Simulation:
     # -------------------------------------------------------------------------
     def _setup_paths(self):
         """Setup input and output file paths."""
-        out_filepath = (
-            # '/Users/rbarreira/Desktop/machine_learning/'
-            # 'material_patches/')
-            '/Volumes/T7/material_patches/')
-        is_irregular = 'irregular' in self.filepath
+        is_irregular = 'irregular' in self.input_path
         if self.dim == 2:
             if is_irregular:
                 self.dir_path = (
-                    f'{out_filepath}_data/'
+                    f'{self.output_path}_data/'
                     f'{self.material_behavior}/'
                     f'{self.dim}d/{self.element_type}/'
                     f'irregular/'
@@ -443,13 +446,13 @@ class Simulation:
                     f'ninc{self.num_increments}/')
             else:
                 self.dir_path = (
-                    f'{out_filepath}_data/'
+                    f'{self.output_path}_data/'
                     f'{self.material_behavior}/'
                     f'{self.dim}d/{self.element_type}/'
                     f'mesh{self.mesh_nx}x{self.mesh_ny}/'
                     f'ninc{self.num_increments}/')
             self.input_filename = (
-                f'{self.filepath}'
+                f'{self.input_path}'
                 f'material_patches_generation_'
                 f'{self.dim}d_{self.element_type}_mesh_'
                 f'{self.mesh_nx}x{self.mesh_ny}/'
@@ -463,14 +466,14 @@ class Simulation:
                     f'Invalid element type for '
                     f'{self.dim}d problem!')
             self.dir_path = (
-                f'{out_filepath}_data/'
+                f'{self.output_path}_data/'
                 f'{self.material_behavior}/'
                 f'{self.dim}d/{self.element_type}/'
                 f'mesh{self.mesh_nx}x{self.mesh_ny}'
                 f'x{self.mesh_nz}/'
                 f'ninc{self.num_increments}/')
             self.input_filename = (
-                f'{self.filepath}'
+                f'{self.input_path}'
                 f'material_patches_generation_'
                 f'{self.dim}d_{self.element_type}_'
                 f'mesh{self.mesh_nx}x{self.mesh_ny}'
@@ -1438,8 +1441,9 @@ def run_simulation(
     is_red_int=False,
     is_save=False,
     is_compute_stiffness=False,
-    filepath='/Users/rbarreira/Desktop/machine_learning/'
-             'material_patches/_data/'
+    input_path='/Users/rbarreira/Desktop/machine_learning/'
+               'material_patches/_data/',
+    output_path='/Volumes/T7/material_patches/linear_bcs/',
 ):
     """Run FEM simulation for material patch analysis.
 
@@ -1467,8 +1471,11 @@ def run_simulation(
         Save simulation output.
     is_compute_stiffness : bool
         Compute boundary stiffness matrices.
-    filepath : str
+    input_path : str
         Base path to material patch input data.
+    output_path : str
+        Base path under which simulation outputs are
+        written.
     """
     sim = Simulation(
         element_type=element_type,
@@ -1481,14 +1488,16 @@ def run_simulation(
         is_red_int=is_red_int,
         is_save=is_save,
         is_compute_stiffness=is_compute_stiffness,
-        filepath=filepath,
+        input_path=input_path,
+        output_path=output_path,
     )
     sim.run()
 
 
 # =============================================================================
 if __name__ == '__main__':
-    filepath = '/Volumes/Expansion/material_patches_data/'
+    input_path = '/Volumes/Expansion/material_patches_data/'
+    output_path = '/Volumes/T7/material_patches/linear_bcs/'
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Test 1: 1x1 irregular patch (all boundary, no
     # interior DOFs -- K_cond == full K)
@@ -1498,7 +1507,8 @@ if __name__ == '__main__':
         material_behavior='elastic',
         num_increments=1,
         patch_idx=0,
-        filepath=filepath,
+        input_path=input_path,
+        output_path=output_path,
         mesh_nx=1,
         mesh_ny=1,
         is_compute_stiffness=True,
@@ -1512,7 +1522,8 @@ if __name__ == '__main__':
         material_behavior='elastic',
         num_increments=1,
         patch_idx=0,
-        filepath=filepath,
+        input_path=input_path,
+        output_path=output_path,
         mesh_nx=5,
         mesh_ny=5,
         is_compute_stiffness=True,
