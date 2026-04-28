@@ -158,21 +158,21 @@ if __name__ == '__main__':
     for idx in range(0, 5000):
         configs.append({
             'element_type': 'quad4',
-            'material_behavior': 'elastoplastic_nlh',
-            'num_increments': 100,
+            'material_behavior': 'elastic',
+            'num_increments': 1,
             'patch_idx': idx,
             'input_path': input_path,
             'output_path': output_path,
-            'mesh_nx': 8,
-            'mesh_ny': 8,
+            'mesh_nx': 4,
+            'mesh_ny': 4,
             'mesh_nz': 1,
             'is_save': True,
             'is_red_int': False,
             'is_compute_stiffness': False,
             'is_save_avg_epbar': False,
             'is_save_nodal_epbar': False,
-            'is_adaptive_timestepping': False,
-            'adaptive_max_subdiv': 8,
+            'is_adaptive_timestepping': True,
+            'adaptive_max_subdiv': 4,
         })
 
     results = run_parallel_simulations(
