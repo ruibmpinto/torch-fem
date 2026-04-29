@@ -78,35 +78,42 @@ def run_simulation_surrogate(
         mesh_nx=1, mesh_ny=1, mesh_nz=1,
         patch_size_x=1, patch_size_y=1,
         patch_size_z=1,
-        model_path=None, edge_type='all',
+        edge_type='all',
         edge_feature_type=('edge_vector',),
         fe_border=0, patch_zones=None,
         is_adaptive_timestepping=False,
-        adaptive_max_subdiv=8):
+        adaptive_max_subdiv=8,
+        *, model_name):
     """Run simulation with Graphorge surrogate model.
 
     Parameters
     ----------
     patch_zones : list[dict], default=None
         List of zone dicts, each with keys:
-        - 'region': (row_start, row_end,
-                     col_start, col_end)
+        - 'region': (row_start, row_end, col_start, col_end)
         - 'patch_size': (nx, ny)
-        When None, a single zone is built from
-        patch_size_x/y covering the full surrogate
-        region (backward compatible).
+        When None, a single zone is built from patch_size_x/y
+        covering the full surrogate region.
     is_adaptive_timestepping : bool, default=False
-        If True, wrap the solve in a retry-and-subdivide
-        loop: on Newton-Raphson failure, re-solve with 2x,
-        4x, ... refinement of the load-factor sequence (up
-        to `adaptive_max_subdiv`) and downsample tensor
-        results back to the original time points. If False,
-        perform a single solve; a convergence failure
-        propagates as an exception.
+        If True, wrap the solve in a retry-and-subdivide loop:
+        on Newton-Raphson failure, re-solve with 2x, 4x, ...
+        refinement of the load-factor sequence (up to
+        `adaptive_max_subdiv`) and downsample tensor results
+        back to the original time points. If False, perform a
+        single solve; a convergence failure propagates as an
+        exception.
     adaptive_max_subdiv : int, default=8
-        Maximum subdivision factor. The retry sequence is
-        the powers of 2 in [1, adaptive_max_subdiv]. Ignored
-        when `is_adaptive_timestepping` is False.
+        Maximum subdivision factor. The retry sequence is the
+        powers of 2 in [1, adaptive_max_subdiv]. Ignored when
+        `is_adaptive_timestepping` is False.
+    model_name : {str, list[str]}
+        Sub-directory name under
+        matpatch_surrogates/{material_behavior}/{NxN}/ from
+        which to load the surrogate model. Required, keyword-
+        only. When patch_zones contains multiple zones, pass a
+        list of length len(patch_zones) with one model name
+        per zone, in zone order. Zones that share the same
+        patch resolution must carry the same model name.
     """
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Monitor memory and time
@@ -150,7 +157,7 @@ def run_simulation_surrogate(
     surrogates_dir = os.path.join(script_dir, 'matpatch_surrogates')
     # Build model path(s) -- single or multi-resolution
     # (deferred until after patch_zones are resolved)
-    # model_path / model_directory_map set below
+    # model_directory_map set below
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Constitutive law
     if material_behavior == 'elastic':
@@ -296,72 +303,74 @@ def run_simulation_surrogate(
                 patch_size_x, patch_size_y),
         }]
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Normalize model_name to a per-zone list parallel to patch_zones.
+    if isinstance(model_name, str):
+        if len(patch_zones) != 1:
+            raise ValueError(
+                f'model_name must be a list of length {len(patch_zones)} '
+                f'(one entry per patch zone) when patch_zones contains '
+                f'multiple zones; got a single string.')
+        model_names_per_zone = [model_name]
+    else:
+        if len(model_name) != len(patch_zones):
+            raise ValueError(
+                f'model_name list length {len(model_name)} does not match '
+                f'number of patch zones {len(patch_zones)}.')
+        model_names_per_zone = list(model_name)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Classify elements into patches (multi-zone)
     patch_id_counter = 0
     patch_resolution = {}
+    model_name_by_res = {}
     is_mat_patch = torch.full(
         (num_elements,), -1, dtype=torch.int)
-    for zone in patch_zones:
+    for zone_idx, zone in enumerate(patch_zones):
         r0, r1, c0, c1 = zone['region']
         psx, psy = zone['patch_size']
         zone_nx = (c1 - c0) // psx
         zone_ny = (r1 - r0) // psy
+        # Bind the resolution to a model name; reject mismatches so the
+        # same resolution cannot pull from two different checkpoints.
+        zone_model_name = model_names_per_zone[zone_idx]
+        if (psx, psy) in model_name_by_res:
+            if model_name_by_res[(psx, psy)] != zone_model_name:
+                raise ValueError(
+                    f'Patch resolution ({psx}, {psy}) is bound to '
+                    f'model_name {model_name_by_res[(psx, psy)]!r} from '
+                    f'an earlier zone but zone {zone_idx} requests '
+                    f'{zone_model_name!r}.')
+        else:
+            model_name_by_res[(psx, psy)] = zone_model_name
         for elem_idx in range(num_elements):
             ei = elem_idx // mesh_nx
             ej = elem_idx % mesh_nx
-            if (r0 <= ei < r1
-                    and c0 <= ej < c1):
+            if r0 <= ei < r1 and c0 <= ej < c1:
                 pi = (ei - r0) // psy
                 pj = (ej - c0) // psx
-                pid = (patch_id_counter
-                       + pi * zone_nx + pj)
+                pid = patch_id_counter + pi * zone_nx + pj
                 is_mat_patch[elem_idx] = pid
-                patch_resolution[pid] = (
-                    psx, psy)
+                patch_resolution[pid] = (psx, psy)
         patch_id_counter += zone_nx * zone_ny
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Build model directory map from unique resolutions
     unique_res = set(patch_resolution.values())
     is_multi_res = len(unique_res) > 1
-    if model_path is not None:
-        # Explicit single model path overrides
-        model_directory_map = model_path
-        patch_resolution_arg = None
-    elif is_multi_res:
-        model_directory_map = {}
-        for res in unique_res:
-            ps = f'{res[0]}x{res[1]}'
-            if material_behavior in (
-                    'elastoplastic',
-                    'elastoplastic_nlh'):
-                model_directory_map[res] = (
-                    os.path.join(
-                        surrogates_dir,
-                        'elastoplastic_nlh',
-                        ps, 'model'))
-            else:
-                model_directory_map[res] = (
-                    os.path.join(
-                        surrogates_dir,
-                        material_behavior,
-                        ps, 'model'))
+    if is_multi_res:
+        model_directory_map = {
+            res: os.path.join(
+                surrogates_dir, material_behavior,
+                f'{res[0]}x{res[1]}', model_name_by_res[res])
+            for res in unique_res}
         patch_resolution_arg = patch_resolution
     else:
-        # Single resolution -- pass str for compat
         res = list(unique_res)[0]
-        ps = f'{res[0]}x{res[1]}'
-        if material_behavior in (
-                'elastoplastic',
-                'elastoplastic_nlh'):
-            model_directory_map = os.path.join(
-                surrogates_dir,
-                'elastoplastic_nlh', ps, 'model')
-        else:
-            model_directory_map = os.path.join(
-                surrogates_dir,
-                material_behavior,
-                ps, 'model_rbmdelete')
+        model_directory_map = os.path.join(
+            surrogates_dir, material_behavior,
+            f'{res[0]}x{res[1]}', model_name_by_res[res])
         patch_resolution_arg = None
+    # Stable per-run suffix used to keep different model variants from
+    # overwriting each other's output directories.
+    output_model_tag = '_'.join(sorted(set(model_names_per_zone)))
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Build patch_elem_per_dim map
     if is_multi_res:
@@ -628,7 +637,7 @@ def run_simulation_surrogate(
     output_dir = os.path.join(
         results_base, material_behavior, f"{dim}d", element_type,
         f"mesh_{mesh_str}", f"patch_{patch_str}",
-        f"n_time_inc_{n_increments}")
+        f"n_time_inc_{n_increments}", output_model_tag)
     os.makedirs(output_dir, exist_ok=True)
 
     # Plot mesh colored by material patch ID
@@ -683,13 +692,11 @@ def run_simulation_surrogate(
         mesh_str += f'x{mesh_nz}'
     n_increments = len(increments) - 1
     output_dir = os.path.join(
-        results_base, material_behavior, f'{dim}d',
-        element_type, f'mesh_{mesh_str}',
-        f'patch_{patch_str}',
-        f'n_time_inc_{n_increments}')
+        results_base, material_behavior, f'{dim}d', element_type,
+        f'mesh_{mesh_str}', f'patch_{patch_str}',
+        f'n_time_inc_{n_increments}', output_model_tag)
     os.makedirs(output_dir, exist_ok=True)
-    stiffness_dir = os.path.join(
-        output_dir, 'stiffness')
+    stiffness_dir = os.path.join(output_dir, 'stiffness')
     os.makedirs(stiffness_dir, exist_ok=True)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Build base solve kwargs shared by all retry attempts
@@ -784,7 +791,8 @@ def run_simulation_surrogate(
     results = {
         'displacements': u.detach().cpu().numpy(),
         'forces': f.detach().cpu().numpy(),
-        'model_path': model_path,
+        'model_directory': model_directory_map,
+        'model_name': model_name,
         'material_patch_ids': is_mat_patch.detach().cpu().numpy()}
 
     output_file = os.path.join(output_dir, "results.pkl")
@@ -951,6 +959,7 @@ if __name__ == '__main__':
         patch_size_y=1,
         is_adaptive_timestepping=False,
         adaptive_max_subdiv=8,
+        model_name='model_potentialhead',
         # patch_zones=[
         #     # Top-left 4x4: rows 0-3, cols 0-3
         #     {'region': (0, 4, 0, 4),
