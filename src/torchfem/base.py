@@ -12,6 +12,7 @@ from torch import Tensor
 
 from .elements import Element, Hexa1, Hexa2, Quad1, Quad2
 from .materials import Material
+from .nonlinear_solvers import solve_nonlinear
 from .sparse import CachedSolve, sparse_solve
 
 is_import_graphorge = (
@@ -655,18 +656,23 @@ class FEM(ABC):
         nlgeom: bool = False,
         return_volumes: bool = False,
         return_resnorm: bool = False,
+        nonlinear_solver: Literal[
+            'newton_raphson', 'damped_picard', 'anderson',
+            'broyden', 'jfnk', 'rand_subspace_newton',
+        ] = 'newton_raphson',
+        nonlinear_solver_opts: dict | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict]:
-        """Solve the FEM problem with the Newton-Raphson method.
+        """Solve the FEM problem with a nonlinear iterative solver.
 
         Args:
             increments (Tensor): Load increment stepping.
-            max_iter (int): Maximum number of iterations during Newton-Raphson.
-            rtol (float): Relative tolerance for Newton-Raphson convergence.
-            atol (float): Absolute tolerance for Newton-Raphson convergence.
-            stol (float): Solver tolerance for iterative methods.
+            max_iter (int): Maximum nonlinear iterations per increment.
+            rtol (float): Relative residual tolerance.
+            atol (float): Absolute residual tolerance.
+            stol (float): Solver tolerance for iterative linear methods.
             verbose (bool): Print iteration information.
             method (str): Method for linear solve
                 ('spsolve','minres','cg','pardiso').
@@ -681,6 +687,15 @@ class FEM(ABC):
                 increment if True.
             return_resnorm (bool): Return residual norm history for each
                 increment if True.
+            nonlinear_solver (str): Iterative scheme used to solve
+                ``r(u) = 0`` per increment. One of ``'newton_raphson'``
+                (default, classical Newton with consistent tangent),
+                ``'damped_picard'``, ``'anderson'``, ``'broyden'``,
+                ``'jfnk'``, ``'rand_subspace_newton'``. See
+                ``torchfem.nonlinear_solvers`` for details.
+            nonlinear_solver_opts (dict, optional): Solver-specific
+                keyword arguments forwarded to the dispatcher (e.g.
+                ``{'damping': 0.5}`` for Damped Picard).
 
         Returns:
                 Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: Final
@@ -738,78 +753,78 @@ class FEM(ABC):
             F_ext = increments[n] * self.forces.ravel()
             DU = inc * self.displacements.clone().ravel()
             de0 = inc * self.ext_strain
-            # Newton-Raphson iterations
-            # Initialize residual list for this increment if requested
-            if return_resnorm:
-                residual_history[n] = []
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Build the per-increment closures consumed by the
+            # nonlinear-solver dispatcher. ``F_int_holder`` and
+            # ``linsolve_call_count`` are mutable single-element lists
+            # used as closure-state cells.
+            F_int_holder = [None]
+            linsolve_call_count = [0]
 
-            for i in range(max_iter):
-                du[con] = DU[con]
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Element-wise integration
-                # profiler = cProfile.Profile()
-                # profiler.enable()
+            def residual_jacobian_fn(du_arg, need_jacobian=True):
+                # Apply prescribed displacement at constrained DOFs.
+                du_arg[con] = DU[con]
+                # Element-wise integration.
                 k, f_i = self.integrate_material(
-                    u, defgrad, stress, state, n, du, de0, nlgeom
+                    u, defgrad, stress, state, n, du_arg, de0,
+                    nlgeom,
                 )
-                # profiler.disable()
-                # print(
-                #     f"\n=== integrate_material PROFILE (increment {n}) ==="
-                # )
-                # stats = pstats.Stats(profiler)
-                # stats.sort_stats('cumulative').print_stats(10)
-                if self.K.numel() == 0 or not self.material.n_state == 0 or \
-                    nlgeom:
+                # Reassemble global stiffness when (a) caller requests
+                # the Jacobian, AND (b) the stiffness is uninitialised,
+                # the material has internal state, or geometry is
+                # nonlinear.
+                if need_jacobian and (
+                    self.K.numel() == 0
+                    or not self.material.n_state == 0
+                    or nlgeom
+                ):
                     self.K = self.assemble_stiffness(k, con)
                 F_int = self.assemble_force(f_i)
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Compute residual
-                residual = F_int - F_ext
-                residual[con] = 0.0
-                res_norm = torch.linalg.norm(residual)
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Save residual norm to history if requested
-                if return_resnorm:
-                    residual_history[n].append(res_norm.item())
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Save initial residual
-                if i == 0:
-                    res_norm0 = res_norm
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Print iteration information
-                if verbose:
-                    print(f"Increment {n} | Iteration {i+1} | "
-                          f"Residual: {res_norm:.5e}")
-                # Check convergence
-                if res_norm < rtol * res_norm0 or res_norm < atol:
-                    break
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Use cached solve from previous iteration if available
+                F_int_holder[0] = F_int
+                # Residual with constrained DOFs zeroed.
+                r = F_int - F_ext
+                r[con] = 0.0
+                K_out = self.K if need_jacobian else None
+                return r, K_out, F_int
+
+            def linsolve_fn(K, r):
+                i = linsolve_call_count[0]
                 if i == 0 and use_cached_solve:
                     cached_solve = self.cached_solve
                 else:
                     cached_solve = CachedSolve()
-                # Only update cache on first iteration
-                update_cache = i == 0
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Solve for displacement increment
-                du -= sparse_solve(
-                    self.K,
-                    residual,
-                    B,
-                    stol,
-                    device,
-                    method,
-                    None,
-                    cached_solve,
-                    update_cache,
+                update_cache = (i == 0)
+                linsolve_call_count[0] += 1
+                return sparse_solve(
+                    K, r, B, stol, device, method, None,
+                    cached_solve, update_cache,
                 )
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Check convergence
-            if res_norm > rtol * res_norm0 and res_norm > atol:
-                raise Exception("Newton-Raphson iteration did not converge.")
+            # Run the requested nonlinear solver.
+            opts = (nonlinear_solver_opts or {}).copy()
+            try:
+                du, history_n = solve_nonlinear(
+                    method=nonlinear_solver,
+                    residual_jacobian_fn=residual_jacobian_fn,
+                    u0=du,
+                    max_iter=max_iter,
+                    rtol=rtol,
+                    atol=atol,
+                    verbose=verbose,
+                    return_resnorm=return_resnorm,
+                    linsolve_fn=linsolve_fn,
+                    **opts,
+                )
+            except Exception:
+                raise
+            # Append the per-increment residual history if requested.
+            if return_resnorm:
+                residual_history[n] = (
+                    history_n if history_n is not None else []
+                )
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Update increment
+            # Update increment using the converged internal force.
+            F_int = F_int_holder[0]
             f[n] = F_int.reshape((-1, self.n_dim))
             u[n] = u[n - 1] + du.reshape((-1, self.n_dim))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1394,6 +1409,7 @@ class FEM(ABC):
         model_cache: dict = None,
         patch_resolution: dict = None,
         is_jacfwd_parallel: bool = False,
+        compute_jacobian: bool = True,
     ) -> tuple[Tensor, Tensor]:
         """Perform surrogate integration using Graphorge material patch model.
 
@@ -1414,12 +1430,21 @@ class FEM(ABC):
                 vectors simultaneously, high memory). If False, build
                 Jacobian column-by-column via jvp (constant memory,
                 slower). Defaults to True.
+            compute_jacobian (bool): If True (default), compute the boundary
+                stiffness via jacfwd / jvp and assemble the global K. If
+                False, skip the Jacobian work entirely: ``K_global`` is
+                returned as ``None``, ``patch_stiffness_dict`` is empty,
+                and only forces (plus hidden state, if applicable) are
+                computed. Forward-only nonlinear solvers (Damped Picard,
+                Anderson, JFNK, RandSub, Broyden after the initial step)
+                use this fast path to bypass the dominant jacfwd cost.
 
         Returns:
             Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, dict]: A tuple
                 containing:
-                - K_global (Tensor): Global stiffness matrix (sparse COO)
-                  of shape (n_dof_global, n_dof_global).
+                - K_global (Tensor or None): Global stiffness matrix (sparse
+                  COO) of shape (n_dof_global, n_dof_global), or ``None``
+                  when ``compute_jacobian=False``.
                 - F_global (Tensor): Global internal force vector of shape
                   (n_dof_global,).
                 - hidden_states_out (dict, optional): Updated hidden states
@@ -1602,77 +1627,63 @@ class FEM(ABC):
                 pred_real = pred_scaled * L
                 return pred_real, pred_real.detach()
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Compute Jacobian: d(forces_boundary)/d(u_boundary)
-            if is_jacfwd_parallel:
-                # Parallel: all tangent vectors at once (high memory)
-                _restore_h0()
-                (jacobian, boundary_forces) = torch_func.jacfwd(
-                    forward, has_aux=True)(boundary_u_current)
-                k_boundary = jacobian.view(
-                    n_dof_boundary, n_dof_boundary)
-                f_boundary = boundary_forces.flatten()
-            else:
-                # Sequential: one jvp per DOF (constant memory)
-                # Restore h0 before force computation.
+            # Forces (always) and Jacobian (only when requested).
+            if not compute_jacobian:
+                # Fast path: forward evaluation only. Skip jacfwd / jvp entirely.
                 _restore_h0()
                 boundary_forces, _ = forward(boundary_u_current)
                 f_boundary = boundary_forces.flatten().detach()
-                # Save hidden_states_trial from the force eval — the
-                # per-column jvp calls below would overwrite it with
-                # drifted values.
+                k_boundary = None
+            elif is_jacfwd_parallel:
+                # Parallel: all tangent vectors at once (high memory).
+                _restore_h0()
+                (jacobian, boundary_forces) = torch_func.jacfwd(
+                    forward, has_aux=True)(boundary_u_current)
+                k_boundary = jacobian.view(n_dof_boundary, n_dof_boundary)
+                f_boundary = boundary_forces.flatten()
+            else:
+                # Sequential: one jvp per DOF (constant memory).
+                _restore_h0()
+                boundary_forces, _ = forward(boundary_u_current)
+                f_boundary = boundary_forces.flatten().detach()
+                # Save hidden_states_trial from the force eval — the per-column
+                # jvp calls below would overwrite it with drifted values.
                 _hs_trial_saved = hidden_states_trial
                 cols = []
                 for i in range(n_dof_boundary):
-                    # Restore h0 before each jvp so every column is
-                    # linearized at the same operating point.
+                    # Restore h0 before each jvp so every column is linearized
+                    # at the same operating point.
                     _restore_h0()
                     tangent = torch.zeros(
-                        n_dof_boundary,
-                        dtype=boundary_u_current.dtype)
+                        n_dof_boundary, dtype=boundary_u_current.dtype)
                     tangent[i] = 1.0
-                    tangent = tangent.view(
-                        n_boundary, self.n_dim)
+                    tangent = tangent.view(n_boundary, self.n_dim)
                     _, jvp_col = torch_func.jvp(
                         lambda u: forward(u)[0],
-                        (boundary_u_current,),
-                        (tangent,))
-                    cols.append(
-                        jvp_col.flatten().detach())
+                        (boundary_u_current,), (tangent,))
+                    cols.append(jvp_col.flatten().detach())
                 k_boundary = torch.stack(cols, dim=1)
-                # Restore hidden_states_trial to the values from the
-                # force eval so the stepwise state carry is correct.
                 hidden_states_trial = _hs_trial_saved
-            # Store per-patch boundary stiffness
-            patch_stiffness_dict[idx_patch] = \
-                k_boundary.detach().clone()
-
+            # Store per-patch boundary stiffness only when computed.
+            if k_boundary is not None:
+                patch_stiffness_dict[idx_patch] = k_boundary.detach().clone()
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # # OLD: Compute Jacobian for all element nodes
-            # (jacobian, node_output) = torch_func.jacfwd(
-            #     forward, has_aux=True)(elem_u_current)
-            # node_forces_trial = node_output.flatten()
-            # # Reshape Jacobian to stiffness matrix format
-            # stiffness_matrix = jacobian.view(n_dof_elem, n_dof_elem)
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Assemble boundary forces to global force vector
-            # Vectorized: map local DOFs to global DOFs
+            # Assemble boundary forces to global force vector. Vectorized:
+            # map local DOFs to global DOFs.
             _dim_range = torch.arange(
                 self.n_dim, device=boundary_node_ids.device)
             global_dofs = (
-                boundary_node_ids.unsqueeze(1) * self.n_dim
-                + _dim_range).flatten()
+                boundary_node_ids.unsqueeze(1) * self.n_dim + _dim_range
+            ).flatten()
             F_global.index_add_(0, global_dofs, f_boundary)
-
-            # Collect boundary stiffness entries (vectorized)
-            rows = global_dofs.unsqueeze(1).expand(
-                -1, n_dof_boundary).flatten()
-            cols = global_dofs.unsqueeze(0).expand(
-                n_dof_boundary, -1).flatten()
-            k_indices_list.append(
-                torch.stack([rows, cols]))
-            k_values_list.append(
-                k_boundary.flatten())
-
+            # Collect boundary stiffness entries only when assembling K.
+            if k_boundary is not None:
+                rows = global_dofs.unsqueeze(1).expand(
+                    -1, n_dof_boundary).flatten()
+                cols = global_dofs.unsqueeze(0).expand(
+                    n_dof_boundary, -1).flatten()
+                k_indices_list.append(torch.stack([rows, cols]))
+                k_values_list.append(k_boundary.flatten())
             # Store updated hidden states for stepwise mode
             if is_stepwise and hidden_states_trial is not None:
                 hidden_states_out[patch_id] = hidden_states_trial
@@ -1681,28 +1692,21 @@ class FEM(ABC):
             # f[idx_patch] = node_forces_trial.flatten()
             # k[idx_patch] = stiffness_matrix
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Build global sparse stiffness matrix
-        k_indices_tensor = torch.cat(
-            k_indices_list, dim=1)
-        k_values_tensor = torch.cat(k_values_list)
-        K_global = torch.sparse_coo_tensor(
-            k_indices_tensor, k_values_tensor,
-            (n_dof_global, n_dof_global)
-        ).coalesce()
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # # OLD: Return element-level arrays
-        # if is_stepwise:
-        #     return k, f, hidden_states_out
-        # else:
-        #     return k, f
+        # Build global sparse stiffness matrix only when requested.
+        if compute_jacobian and k_indices_list:
+            k_indices_tensor = torch.cat(k_indices_list, dim=1)
+            k_values_tensor = torch.cat(k_values_list)
+            K_global = torch.sparse_coo_tensor(
+                k_indices_tensor, k_values_tensor,
+                (n_dof_global, n_dof_global),
+            ).coalesce()
+        else:
+            K_global = None
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if is_stepwise:
-            return (K_global, F_global,
-                    hidden_states_out,
-                    patch_stiffness_dict)
+            return (K_global, F_global, hidden_states_out, patch_stiffness_dict)
         else:
-            return (K_global, F_global,
-                    patch_stiffness_dict)
+            return (K_global, F_global, patch_stiffness_dict)
     # -------------------------------------------------------------------------
     def solve_matpatch(
         self,
@@ -1732,6 +1736,11 @@ class FEM(ABC):
         stiffness_output_dir: str | None = None,
         patch_size_label: str | None = None,
         is_jacfwd_parallel: bool = False,
+        nonlinear_solver: Literal[
+            'newton_raphson', 'damped_picard', 'anderson',
+            'broyden', 'jfnk', 'rand_subspace_newton',
+        ] = 'newton_raphson',
+        nonlinear_solver_opts: dict | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | tuple[
@@ -1931,146 +1940,166 @@ class FEM(ABC):
             F_ext = increments[n] * self.forces.ravel()
             DU = inc * self.displacements.clone().ravel()
             de0 = inc * self.ext_strain
-            # Initialize residual norm list for this increment if requested
-            if return_resnorm:
-                residual_history[n] = []
-            # Newton-Raphson iterations
-            for i in range(max_iter):
-                du[con] = DU[con]
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # FE integration (regular elements)
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Per-increment closure state. The mutable single-element
+            # lists act as cells that the closure populates so that the
+            # outer scope can read converged FE/surrogate quantities
+            # (forces, hidden state, per-patch stiffness) after the
+            # dispatcher returns.
+            patch_ids_local = None
+            if has_surr:
+                patch_ids_local = torch.unique(
+                    is_mat_patch[patch_mask])
+            F_int_holder = [None]
+            hidden_state_out_holder = [None]
+            patch_k_dict_holder = [{}]
+            linsolve_call_count = [0]
+
+            def residual_jacobian_fn(du_arg, need_jacobian=True):
+                du_arg[con] = DU[con]
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # FE integration (regular elements).
                 K_fe = None
                 F_fe = None
                 if has_fe:
-                    K_fe, F_fe = (
-                        self._integrate_fe_subset(
-                            fe_indices, u, defgrad,
-                            stress, state, n, du,
-                            de0, nlgeom))
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Surrogate integration (patch elements)
+                    K_fe, F_fe = self._integrate_fe_subset(
+                        fe_indices, u, defgrad, stress, state,
+                        n, du_arg, de0, nlgeom)
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Surrogate integration (patch elements).
                 K_surr = None
                 F_surr = None
-                patch_k_dict = {}
-                hidden_state_out = None
+                patch_k_dict_local = {}
+                hidden_state_local = None
                 if has_surr:
-                    patch_ids = torch.unique(
-                        is_mat_patch[patch_mask])
                     surr_kwargs = dict(
                         model=None,
-                        u=u, n=n, du=du,
+                        u=u, n=n, du=du_arg,
                         is_stepwise=is_stepwise,
-                        patch_ids=patch_ids,
-                        edge_feature_type=
-                            edge_feature_type,
+                        patch_ids=patch_ids_local,
+                        edge_feature_type=edge_feature_type,
                         model_cache=model_cache,
-                        patch_resolution=
-                            patch_resolution,
-                        is_jacfwd_parallel=
-                            is_jacfwd_parallel)
+                        patch_resolution=patch_resolution,
+                        is_jacfwd_parallel=is_jacfwd_parallel,
+                        compute_jacobian=need_jacobian,
+                    )
                     if is_stepwise:
-                        surr_kwargs[
-                            'hidden_states'] = (
+                        surr_kwargs['hidden_states'] = (
                             hidden_states_dict)
                         (K_surr, F_surr,
-                         hidden_state_out,
-                         patch_k_dict) = \
-                            self \
-                            .surrogate_integrate_material(
-                            **surr_kwargs)
+                         hidden_state_local,
+                         patch_k_dict_local) = (
+                            self.surrogate_integrate_material(
+                                **surr_kwargs))
                     else:
                         (K_surr, F_surr,
-                         patch_k_dict) = \
-                            self \
-                            .surrogate_integrate_material(
-                            **surr_kwargs)
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Combine FE and surrogate contributions
+                         patch_k_dict_local) = (
+                            self.surrogate_integrate_material(
+                                **surr_kwargs))
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Combine FE and surrogate contributions.
                 if has_fe and has_surr:
-                    K_combined = (
-                        K_fe + K_surr).coalesce()
-                    F_int = F_fe + F_surr
+                    F_int_combined = F_fe + F_surr
+                    if need_jacobian:
+                        K_combined = (K_fe + K_surr).coalesce()
+                    else:
+                        K_combined = None
                 elif has_fe:
-                    K_combined = K_fe
-                    F_int = F_fe
+                    F_int_combined = F_fe
+                    K_combined = K_fe if need_jacobian else None
                 else:
-                    K_combined = K_surr
-                    F_int = F_surr
-                # Apply constraint elimination
-                self.K = (
-                    self._apply_constraints_sparse(
-                        K_combined, con))
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Compute residual
-                residual = F_int - F_ext
-                residual[con] = 0.0
-                res_norm = torch.linalg.norm(residual)
-                # Save residual norm to history if requested
-                if return_resnorm:
-                    residual_history[n].append(res_norm.item())
-                # Save initial residual for relative error
-                if i == 0:
-                    res_norm0 = res_norm
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Print iteration information
-                if verbose:
-                    print(f"Increment {n} | Iteration {i+1} | "
-                          f"Residual: {res_norm:.5e}")
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Check convergence
-                if res_norm < rtol * res_norm0 or res_norm < atol:
-                    # Update patch-specific hidden states
-                    # with converged values
-                    if is_stepwise:
-                        for pid in patch_ids:
-                            patch_key = \
-                                f"patch_{pid.item()}"
-                            hidden_states_dict[patch_key] = \
-                                hidden_state_out[patch_key]
-                    # Save converged per-patch stiffness
-                    if (is_export_stiffness
-                            and stiffness_output_dir):
-                        import os
-                        for pid, k_mat in \
-                                patch_k_dict.items():
-                            fname = (
-                                f'stiffness_'
-                                f'{patch_size_label}'
-                                f'_id{pid}'
-                                f'_inc{n}.npy')
-                            np.save(
-                                os.path.join(
-                                    stiffness_output_dir,
-                                    fname),
-                                k_mat.cpu().numpy())
-                    break
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Use cached solve from previous iteration if available
+                    F_int_combined = F_surr
+                    K_combined = K_surr if need_jacobian else None
+                # Apply constraint elimination only when assembling K.
+                if need_jacobian and K_combined is not None:
+                    self.K = self._apply_constraints_sparse(
+                        K_combined, con)
+                # Cache outputs that the outer scope needs after
+                # convergence. ``hidden_state_local`` may legitimately
+                # be ``None`` when not in stepwise mode.
+                F_int_holder[0] = F_int_combined
+                if hidden_state_local is not None:
+                    hidden_state_out_holder[0] = hidden_state_local
+                if patch_k_dict_local:
+                    patch_k_dict_holder[0] = patch_k_dict_local
+                # Residual with constrained DOFs zeroed.
+                r = F_int_combined - F_ext
+                r[con] = 0.0
+                K_out = self.K if need_jacobian else None
+                return r, K_out, F_int_combined
+
+            def linsolve_fn(K, r):
+                i = linsolve_call_count[0]
                 if i == 0 and use_cached_solve:
                     cached_solve = self.cached_solve
                 else:
                     cached_solve = CachedSolve()
-                # Only update cache on first iteration
-                update_cache = i == 0
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Solve for displacement increment
-                du -= sparse_solve(
-                    self.K,
-                    residual,
-                    None,
-                    stol,
-                    device,
-                    method,
-                    None,
-                    cached_solve,
-                    update_cache,
+                update_cache = (i == 0)
+                linsolve_call_count[0] += 1
+                return sparse_solve(
+                    K, r, None, stol, device, method, None,
+                    cached_solve, update_cache,
                 )
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Raise an Exception if the model did not converge
-            if res_norm > rtol * res_norm0 and res_norm > atol:
-                raise Exception("Newton-Raphson iteration did not converge.")
+            # Run the requested nonlinear solver.
+            opts = (nonlinear_solver_opts or {}).copy()
+            du, history_n = solve_nonlinear(
+                method=nonlinear_solver,
+                residual_jacobian_fn=residual_jacobian_fn,
+                u0=du,
+                max_iter=max_iter,
+                rtol=rtol,
+                atol=atol,
+                verbose=verbose,
+                return_resnorm=return_resnorm,
+                linsolve_fn=linsolve_fn,
+                **opts,
+            )
+            if return_resnorm:
+                residual_history[n] = (
+                    history_n if history_n is not None else []
+                )
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Update increment
+            # If the converged step came from a forward-only solver
+            # without a final ``need_jacobian=True`` evaluation, the
+            # per-patch stiffness export buffer may still be empty;
+            # one extra call brings the surrogate state in line.
+            need_export_refresh = (
+                is_export_stiffness
+                and stiffness_output_dir is not None
+                and (not patch_k_dict_holder[0])
+            )
+            if need_export_refresh:
+                _ = residual_jacobian_fn(du, need_jacobian=True)
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Post-convergence bookkeeping (hidden state propagation,
+            # per-patch stiffness export).
+            F_int = F_int_holder[0]
+            hidden_state_out = hidden_state_out_holder[0]
+            patch_k_dict = patch_k_dict_holder[0]
+            if (is_stepwise and has_surr
+                    and hidden_state_out is not None):
+                for pid in patch_ids_local:
+                    patch_key = f'patch_{pid.item()}'
+                    if patch_key in hidden_state_out:
+                        hidden_states_dict[patch_key] = (
+                            hidden_state_out[patch_key])
+            if (is_export_stiffness
+                    and stiffness_output_dir is not None
+                    and patch_k_dict):
+                import os
+                for pid, k_mat in patch_k_dict.items():
+                    fname = (
+                        f'stiffness_{patch_size_label}'
+                        f'_id{pid}_inc{n}.npy'
+                    )
+                    np.save(
+                        os.path.join(
+                            stiffness_output_dir, fname),
+                        k_mat.cpu().numpy(),
+                    )
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Update increment.
             f[n] = F_int.reshape((-1, self.n_dim))
             u[n] = u[n - 1] + du.reshape((-1, self.n_dim))
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

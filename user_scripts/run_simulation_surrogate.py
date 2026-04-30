@@ -83,6 +83,8 @@ def run_simulation_surrogate(
         fe_border=0, patch_zones=None,
         is_adaptive_timestepping=False,
         adaptive_max_subdiv=8,
+        nonlinear_solver='newton_raphson',
+        nonlinear_solver_opts=None,
         *, model_name):
     """Run simulation with Graphorge surrogate model.
 
@@ -521,7 +523,9 @@ def run_simulation_surrogate(
     u_ref, f_ref, _, _, state_ref, res_hist_ref = \
         domain.solve(
             increments=increments_ref, rtol=1e-8,
-            verbose=True, return_resnorm=True)
+            verbose=True, return_resnorm=True,
+            nonlinear_solver=nonlinear_solver,
+            nonlinear_solver_opts=nonlinear_solver_opts)
     profiler_solve.disable()
     print("\n=== SOLVE METHOD PROFILE ===")
     stats_solve = pstats.Stats(profiler_solve)
@@ -710,7 +714,9 @@ def run_simulation_surrogate(
         patch_resolution=patch_resolution_arg,
         edge_type=edge_type, edge_feature_type=edge_feature_type,
         is_export_stiffness=True, stiffness_output_dir=stiffness_dir,
-        patch_size_label=patch_str)
+        patch_size_label=patch_str,
+        nonlinear_solver=nonlinear_solver,
+        nonlinear_solver_opts=nonlinear_solver_opts)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Solve (with optional adaptive sub-increment)
     if not is_adaptive_timestepping:
@@ -946,20 +952,26 @@ if __name__ == '__main__':
     # Top-right 4x4 block -> four 2x2 patches
     # Bot-left 4x4 block  -> four 2x2 patches
     # Bot-right 4x4 block -> one 4x4 patch
+    # Nonlinear solver. One of:
+    #   'newton_raphson', 'damped_picard', 'anderson',
+    #   'broyden', 'jfnk', 'rand_subspace_newton'.
+    nonlinear_solver = 'newton_raphson'
+    nonlinear_solver_opts = None
     run_simulation_surrogate(
         element_type='quad4',
         material_behavior='elastoplastic_nlh',
         mesh_nx=10,
         mesh_ny=10,
         edge_type='all',
-        edge_feature_type=(
-            'edge_vector', 'relative_disp'),
-        # fe_border=0,
+        edge_feature_type=('edge_vector', 'relative_disp'),
         patch_size_x=1,
         patch_size_y=1,
         is_adaptive_timestepping=False,
         adaptive_max_subdiv=8,
-        model_name='model_potentialhead',
+        nonlinear_solver=nonlinear_solver,
+        nonlinear_solver_opts=nonlinear_solver_opts,
+        model_name='model_reference',
+        # fe_border=0,
         # patch_zones=[
         #     # Top-left 4x4: rows 0-3, cols 0-3
         #     {'region': (0, 4, 0, 4),

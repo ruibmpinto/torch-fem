@@ -154,6 +154,12 @@ if __name__ == '__main__':
     input_path = '/Volumes/Expansion/material_patches_data/'
     output_path = '/Volumes/T7/material_patches/linear_bcs/'
 
+    # Nonlinear solver selection. One of:
+    #   'newton_raphson', 'damped_picard', 'anderson',
+    #   'broyden', 'jfnk', 'rand_subspace_newton'.
+    nonlinear_solver = 'newton_raphson'
+    nonlinear_solver_opts = None
+
     configs = []
     for idx in range(0, 5000):
         configs.append({
@@ -173,6 +179,8 @@ if __name__ == '__main__':
             'is_save_nodal_epbar': False,
             'is_adaptive_timestepping': True,
             'adaptive_max_subdiv': 4,
+            'nonlinear_solver': nonlinear_solver,
+            'nonlinear_solver_opts': nonlinear_solver_opts,
         })
 
     results = run_parallel_simulations(

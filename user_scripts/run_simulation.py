@@ -304,6 +304,8 @@ class Simulation:
         is_analytical_tangent=True,
         is_adaptive_timestepping=False,
         adaptive_max_subdiv=8,
+        nonlinear_solver='newton_raphson',
+        nonlinear_solver_opts=None,
         input_path='/Users/rbarreira/Desktop/'
                    'machine_learning/'
                    'material_patches/_data/',
@@ -397,6 +399,8 @@ class Simulation:
                 f'adaptive_max_subdiv must be >= 1, '
                 f'got {adaptive_max_subdiv}.')
         self.adaptive_max_subdiv = adaptive_max_subdiv
+        self.nonlinear_solver = nonlinear_solver
+        self.nonlinear_solver_opts = nonlinear_solver_opts
         self.input_path = input_path
         self.output_path = output_path
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1150,7 +1154,10 @@ class Simulation:
             return_intermediate=True,
             aggregate_integration_points=True,
             aggregate_state=False,
-            return_volumes=True)
+            return_volumes=True,
+            nonlinear_solver=self.nonlinear_solver,
+            nonlinear_solver_opts=self.nonlinear_solver_opts,
+        )
 
     # -------------------------------------------------------------------------
     def postprocess_results(
