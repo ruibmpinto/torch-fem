@@ -345,3 +345,25 @@ def test_gtn3d_requires_all_arguments():
     # No constructor defaults: omitting gtn_params is a TypeError.
     with pytest.raises(TypeError):
         GTN3D(1000.0, 0.3, linear_flow_stress)
+
+
+def test_far_overshot_trial_stays_finite():
+    # A trial state hundreds of yield stresses beyond the surface
+    # (a far-overshot global Newton iterate) must stay finite: the
+    # cosh/sinh arguments are clamped, so the return map either
+    # converges or raises - it never produces NaN.
+    params = make_params(f_n=0.0)
+    sigma_y = torch.tensor([100.0])
+    sigma_h = torch.tensor([5.0e5])
+    fs = torch.tensor([0.05])
+    phi = gtn_yield(torch.tensor([1.0e5]), sigma_h, sigma_y, fs,
+                    1.5, 1.0)
+    assert torch.all(torch.isfinite(phi))
+    sigma = torch.zeros(1, 3, 3)
+    sigma[0, 0, 0] = 6.0e5
+    sigma[0, 1, 1] = sigma[0, 2, 2] = 4.5e5
+    _, _, s_dev = stress_invariants(sigma)
+    n = gtn_flow_normal(s_dev, sigma_h, sigma_y, fs, 1.5, 1.0)
+    assert torch.all(torch.isfinite(n))
+    assert torch.allclose(
+        torch.linalg.norm(n, dim=(-1, -2)), torch.ones(1))

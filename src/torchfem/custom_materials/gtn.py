@@ -225,10 +225,15 @@ def gtn_yield(sigma_eq, sigma_h, sigma_y, fs, q1, q2):
     phi : torch.Tensor
         Yield function value of shape ``(...,)``.
     """
-    # Deviatoric, porosity and pressure contributions.
+    # Deviatoric, porosity and pressure contributions. The cosh
+    # argument is clamped at +-350 (float64 overflows near 710):
+    # beyond the clamp the yield value's sign -- all the bisection
+    # needs -- is unambiguous, and the clamp keeps far-overshot
+    # Newton trial states finite instead of propagating inf/NaN.
     ratio_sq = (sigma_eq / sigma_y) ** 2
-    pressure = 2.0 * q1 * fs * torch.cosh(
-        1.5 * q2 * sigma_h / sigma_y)
+    arg = torch.clamp(
+        1.5 * q2 * sigma_h / sigma_y, min=-350.0, max=350.0)
+    pressure = 2.0 * q1 * fs * torch.cosh(arg)
     return ratio_sq + pressure - (1.0 + (q1 * fs) ** 2)
 # =============================================================================
 def nucleation_intensity(peeq_m, f_n, eps_n, s_n):
@@ -299,8 +304,13 @@ def gtn_flow_normal(s_dev, sigma_h, sigma_y, fs, q1, q2):
     # Deviatoric part of the yield gradient.
     deviatoric = 3.0 * s_dev / (sigma_y ** 2)[..., None, None]
     # Volumetric part of the yield gradient (analytic derivative).
-    volumetric = (q1 * q2 * fs * torch.sinh(
-        1.5 * q2 * sigma_h / sigma_y) / sigma_y)
+    # The sinh argument carries the same +-350 overflow clamp as
+    # the yield function; the direction is normalized afterwards,
+    # so only the (saturated) deviatoric/volumetric mix changes for
+    # far-overshot trial states.
+    arg = torch.clamp(
+        1.5 * q2 * sigma_h / sigma_y, min=-350.0, max=350.0)
+    volumetric = q1 * q2 * fs * torch.sinh(arg) / sigma_y
     identity = torch.eye(
         3, dtype=s_dev.dtype, device=s_dev.device)
     direction = deviatoric + volumetric[..., None, None] * identity
