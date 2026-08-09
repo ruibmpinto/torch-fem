@@ -1,0 +1,3 @@
+[submodule "projects/femu_voiddamage_resistance"]
+	path = projects/femu_voiddamage_resistance
+	url = git@github.com:ruibmpinto/femu_voiddamage_resistance.git
