@@ -187,16 +187,29 @@ def _print_iter(method: str, n_iter: int, r_norm: Tensor) -> None:
 
 def _check_converged(
     r_norm: Tensor, r_norm_0: Tensor, atol: float, rtol: float,
+    floor: float = 1e-21,
 ) -> bool:
-    """Return True if absolute or relative tolerance is satisfied.
+    """Return True if any convergence tolerance is satisfied.
 
     The comparison is non-strict so that an exactly zero residual
     counts as converged: a problem in which every degree of freedom is
     prescribed has nothing left to solve, and a strict test would run
     it to the iteration cap and then report failure.
+
+    ``floor`` is an absolute residual, in force units, below which the
+    iteration is treated as converged whatever the relative test asks
+    for. It matters when the entry state is already in equilibrium:
+    ``r_norm_0`` is then itself at roundoff and ``rtol * r_norm_0``
+    demands a residual smaller than the assembled sum of element
+    forces can represent, so the iteration stalls and reports a
+    failure that is purely numerical.
+
+    The default is far below any physically meaningful out-of-balance
+    force for the scales this library is used at; a problem whose
+    genuine forces are of order 1e-21 has to lower it explicitly.
     """
     return bool(
-        (r_norm <= atol) or (r_norm <= rtol * r_norm_0)
+        r_norm <= max(atol, float(rtol * r_norm_0), floor)
     )
 
 
