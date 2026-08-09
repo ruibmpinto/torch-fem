@@ -54,6 +54,8 @@ Functions
 ---------
 validate_gtn_params
     Strict validation of the GTN parameter dictionary.
+polar_log
+    Rotation and logarithmic stretch of a deformation gradient.
 stress_invariants
     Hydrostatic stress, von Mises stress and deviator.
 f_star
@@ -131,6 +133,48 @@ def validate_gtn_params(gtn_params):
         raise ValueError(
             f'gtn_params contains unknown keys: {unknown}.')
     return gtn_params
+# =============================================================================
+def polar_log(f):
+    """Rotation and logarithmic stretch of a deformation gradient.
+
+    Splits ``f = R U`` with ``R`` orthogonal and ``U`` symmetric
+    positive definite, and returns ``R`` together with ``ln U``. Both
+    follow from the eigendecomposition of ``C = f^T f``, which is
+    exact, batched and differentiable.
+
+    ``ln U`` is objective: superposing a rigid rotation on ``f``
+    leaves it unchanged, because the rotation cancels in ``f^T f``.
+    For an infinitesimal increment it reduces to the symmetric
+    displacement gradient, so the small-strain description is its
+    limit rather than a separate model.
+
+    Parameters
+    ----------
+    f : torch.Tensor
+        Deformation gradient of shape ``(..., 3, 3)``.
+
+    Returns
+    -------
+    rotation : torch.Tensor
+        Orthogonal factor of shape ``(..., 3, 3)``.
+    stretch_log : torch.Tensor
+        Logarithmic stretch of shape ``(..., 3, 3)``.
+    """
+    cauchy_green = f.transpose(-1, -2) @ f
+    eigenvalues, eigenvectors = torch.linalg.eigh(cauchy_green)
+    # C is positive definite for any admissible deformation, so a
+    # non-positive eigenvalue means the element has inverted.
+    if bool((eigenvalues <= 0.0).any()):
+        raise ValueError(
+            'Right Cauchy-Green tensor is not positive definite: the '
+            'deformation gradient is singular or inverted.')
+    roots = torch.sqrt(eigenvalues)
+    transposed = eigenvectors.transpose(-1, -2)
+    stretch_inverse = (eigenvectors @ torch.diag_embed(1.0 / roots)
+                       @ transposed)
+    stretch_log = (eigenvectors @ torch.diag_embed(torch.log(roots))
+                   @ transposed)
+    return f @ stretch_inverse, stretch_log
 # =============================================================================
 def stress_invariants(sigma):
     """Hydrostatic stress, von Mises stress and deviator.
@@ -658,7 +702,8 @@ class GTN3D(IsotropicElasticity3D):
         Perform an incremental state update for a batch of
         elements.
     """
-    def __init__(self, E, nu, flow_stress_fn, gtn_params):
+    def __init__(self, E, nu, flow_stress_fn, gtn_params,
+                 kinematics='small_strain'):
         """Constructor.
 
         Parameters
@@ -673,11 +718,33 @@ class GTN3D(IsotropicElasticity3D):
         gtn_params : dict
             GTN parameters, validated strictly (see
             :func:`validate_gtn_params`).
+        kinematics : str, default='small_strain'
+            Kinematic description.
+
+            ``'small_strain'`` takes the symmetric part of the
+            displacement gradient increment and ignores the
+            deformation gradient. Valid while rotations are small,
+            and the previous behaviour of this class.
+
+            ``'corotational'`` splits the relative deformation
+            gradient of the increment into a rotation and a stretch,
+            rotates the stored stress into the current frame, and
+            passes the logarithmic stretch as the strain increment.
+            The result is objective: a superposed rigid rotation
+            leaves the stress state unchanged. This is the interface
+            an explicit co-rotational VUMAT provides, which is what
+            the return map of :func:`gtn_return_map` was written
+            against, so the return map itself is used unchanged.
         """
         super().__init__(E, nu)
         # Validate at construction so misconfiguration fails early.
         self.gtn_params = validate_gtn_params(gtn_params)
         self.flow_stress_fn = flow_stress_fn
+        if kinematics not in ('small_strain', 'corotational'):
+            raise ValueError(
+                f"Unknown kinematics '{kinematics}'; expected "
+                "'small_strain' or 'corotational'.")
+        self.kinematics = kinematics
         # State layout: [peeq_m, f, dlam_warm].
         self.n_state = 3
     # -------------------------------------------------------------------------
@@ -706,7 +773,8 @@ class GTN3D(IsotropicElasticity3D):
                 'GTN3D material is already vectorized.')
         E = self.E.repeat(n_elem)
         nu = self.nu.repeat(n_elem)
-        return GTN3D(E, nu, self.flow_stress_fn, self.gtn_params)
+        return GTN3D(E, nu, self.flow_stress_fn, self.gtn_params,
+                     self.kinematics)
     # -------------------------------------------------------------------------
     def step(self, H_inc, F, sigma, state, de0):
         """Perform a strain increment with the GTN model.
@@ -738,11 +806,22 @@ class GTN3D(IsotropicElasticity3D):
         ddsdde : torch.Tensor
             Algorithmic tangent of shape ``(..., 3, 3, 3, 3)``.
         """
-        # Small-strain increment from the displacement gradient.
-        de = 0.5 * (H_inc.transpose(-1, -2) + H_inc)
+        if self.kinematics == 'small_strain':
+            # Symmetric part of the displacement gradient increment.
+            de = 0.5 * (H_inc.transpose(-1, -2) + H_inc)
+            sigma_in = sigma
+        else:
+            # Relative deformation gradient of this increment, split into
+            # a rotation and a stretch.
+            f_rel = (F + H_inc) @ torch.linalg.inv(F)
+            rotation, stretch_log = polar_log(f_rel)
+            # Carry the stored stress into the current frame, and use the
+            # logarithmic stretch as the objective strain increment.
+            sigma_in = rotation @ sigma @ rotation.transpose(-1, -2)
+            de = stretch_log
         # Mechanical part: total minus external (thermal) strain.
         out = gtn_return_map(
-            sigma, state[..., 0], state[..., 1], state[..., 2],
+            sigma_in, state[..., 0], state[..., 1], state[..., 2],
             de - de0, self.C, self.flow_stress_fn,
             self.gtn_params)
         # Updated state: accumulated matrix plastic strain, void
