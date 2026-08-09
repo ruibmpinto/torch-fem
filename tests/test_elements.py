@@ -105,12 +105,19 @@ test_hexa2 = torch.tensor(
     ],
 )
 def test_jacobian(elem, nodes):
-    volume = torch.tensor([0.0])
+    # The node fixtures are built at import time and therefore in
+    # whatever the default dtype was then, while ipoints() follows
+    # the default at call time; other test modules set it globally.
+    # Align them explicitly so the test does not depend on import
+    # order.
+    nodes = nodes.to(elem.ipoints().dtype)
+    volume = torch.zeros(1, dtype=elem.ipoints().dtype)
     for w, q in zip(elem.iweights(), elem.ipoints(), strict=False):
         J = elem.B(q) @ nodes
         detJ = torch.linalg.det(J)
         volume += w * detJ
-    assert torch.allclose(volume, torch.tensor([1.0]), atol=1e-5)
+    assert torch.allclose(
+        volume, torch.ones(1, dtype=volume.dtype), atol=1e-5)
 
 
 @pytest.mark.parametrize(

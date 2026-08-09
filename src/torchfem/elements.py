@@ -42,11 +42,11 @@ class Bar1(Element):
         return 1 / 2 * torch.stack([N_1, N_2], dim=-1)
 
     def B(self, xi: Tensor) -> Tensor:
+        grad = torch.tensor(
+            [[-0.5, 0.5]], dtype=xi.dtype, device=xi.device)
         if xi.dim() == 1:
-            return torch.tensor([[-0.5, 0.5]])
-        else:
-            N = xi.shape[0]
-            return torch.tensor([[-0.5, 0.5]]).repeat(N, 1, 1)
+            return grad
+        return grad.repeat(xi.shape[0], 1, 1)
 
     def ipoints(self) -> Tensor:
         return torch.tensor([[0.0]])
@@ -104,13 +104,12 @@ class Tria1(Element):
         return torch.stack([N_1, N_2, N_3], dim=-1)
 
     def B(self, xi: Tensor) -> Tensor:
+        grad = torch.tensor(
+            [[-1.0, 1.0, 0.0], [-1.0, 0.0, 1.0]],
+            dtype=xi.dtype, device=xi.device)
         if xi.dim() == 1:
-            return torch.tensor([[-1.0, 1.0, 0.0], [-1.0, 0.0, 1.0]])
-        else:
-            N = xi.shape[0]
-            return torch.tensor(
-                [[-1.0, 1.0, 0.0], [-1.0, 0.0, 1.0]]
-            ).repeat(N, 1, 1)
+            return grad
+        return grad.repeat(xi.shape[0], 1, 1)
 
     def ipoints(self) -> Tensor:
         return torch.tensor([[1.0 / 3.0, 1.0 / 3.0]])
@@ -383,19 +382,14 @@ class Tetra1(Element):
         return torch.stack([N_1, N_2, N_3, N_4], dim=-1)
 
     def B(self, xi: Tensor) -> Tensor:
+        grad = torch.tensor(
+            [[-1.0, 1.0, 0.0, 0.0],
+             [-1.0, 0.0, 1.0, 0.0],
+             [-1.0, 0.0, 0.0, 1.0]],
+            dtype=xi.dtype, device=xi.device)
         if xi.dim() == 1:
-            return torch.tensor(
-                [[-1.0, 1.0, 0.0, 0.0],
-                 [-1.0, 0.0, 1.0, 0.0],
-                 [-1.0, 0.0, 0.0, 1.0]]
-            )
-        else:
-            N = xi.shape[0]
-            return torch.tensor(
-                [[-1.0, 1.0, 0.0, 0.0],
-                 [-1.0, 0.0, 1.0, 0.0],
-                 [-1.0, 0.0, 0.0, 1.0]]
-            ).repeat(N, 1, 1)
+            return grad
+        return grad.repeat(xi.shape[0], 1, 1)
 
     def ipoints(self) -> Tensor:
         return torch.tensor([[0.25, 0.25, 0.25]])
