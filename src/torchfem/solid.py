@@ -8,10 +8,19 @@ from .materials import Material
 
 
 class Solid(FEM):
-    def __init__(self, nodes: Tensor, elements: Tensor, material: Material):
-        """Initialize the solid FEM problem."""
+    def __init__(self, nodes: Tensor, elements: Tensor, material: Material,
+                 formulation: str = "full"):
+        """Initialize the solid FEM problem.
 
-        super().__init__(nodes, elements, material)
+        Args:
+            nodes (Tensor): Nodal coordinates.
+            elements (Tensor): Element connectivity.
+            material (Material): Material model instance.
+            formulation (str): Strain-displacement formulation, either
+                "full" (default) or "b_bar". See FEM.
+        """
+
+        super().__init__(nodes, elements, material, formulation)
 
         # Set element type depending on number of nodes per element
         if len(elements[0]) == 4:

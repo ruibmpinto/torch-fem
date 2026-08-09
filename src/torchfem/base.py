@@ -41,7 +41,8 @@ if is_import_graphorge:
 
 
 class FEM(ABC):
-    def __init__(self, nodes: Tensor, elements: Tensor, material: Material):
+    def __init__(self, nodes: Tensor, elements: Tensor, material: Material,
+                 formulation: str = "full"):
         """Initialize a general finite element problem.
 
         Args:
@@ -49,6 +50,19 @@ class FEM(ABC):
             elements (Tensor): Element connectivity of shape
                 (n_elements, n_nodes_per_element).
             material (Material): Material model instance.
+            formulation (str): Strain-displacement formulation.
+
+                - "full" (default): the standard displacement element,
+                  reproducing the previous behaviour exactly.
+                - "b_bar": the volumetric part of the strain increment
+                  is replaced by its element average. This removes the
+                  volumetric locking that fully integrated elements
+                  suffer under near-incompressible flow, such as
+                  developed plasticity.
+
+                "b_bar" is implemented for three-dimensional continua
+                under small strains, and its correction is built on the
+                reference configuration.
 
         Note:
             Automatically vectorizes non-vectorized materials for efficient
@@ -57,6 +71,16 @@ class FEM(ABC):
         # Store nodes and elements
         self.nodes = nodes
         self.elements = elements
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Strain-displacement formulation, validated here so that an
+        # unsupported name fails at construction rather than inside the
+        # integration loop.
+        if formulation not in ("full", "b_bar"):
+            raise ValueError(
+                f"Unknown formulation '{formulation}'. "
+                "Choose from 'full' or 'b_bar'."
+            )
+        self.formulation = formulation
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Compute problem size
         self.n_dofs = torch.numel(self.nodes)
@@ -272,6 +296,42 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return k
     # -------------------------------------------------------------------------
+    def dilatational_correction(self):
+        """Correction operators of the averaged formulations.
+
+        Returns ``G = (B_mean - B) / 3`` at every quadrature point,
+        where ``B_mean`` is the volume-averaged gradient operator of
+        the element. Contracting ``G`` with a nodal displacement gives
+        the amount by which the pointwise volumetric strain has to be
+        shifted to equal the element-averaged one, which is what the
+        b-bar formulation replaces.
+
+        Obtaining the average needs its own pass over the quadrature
+        points, since it is not known until every point has been
+        visited; that is why this cannot be folded into the main
+        integration loop.
+
+        Returns:
+            list[Tensor]: One correction operator of shape
+                (n_elem, n_dim, n_nod) per quadrature point.
+        """
+        operators = []
+        volume = None
+        weighted = None
+        for w, xi in zip(self.etype.iweights(), self.etype.ipoints(),
+                         strict=False):
+            _, B, detJ = self.eval_shape_functions(xi)
+            operators.append(B)
+            contribution = w * detJ
+            if weighted is None:
+                weighted = contribution[:, None, None] * B
+                volume = contribution
+            else:
+                weighted = weighted + contribution[:, None, None] * B
+                volume = volume + contribution
+        B_mean = weighted / volume[:, None, None]
+        return [(B_mean - B) / 3.0 for B in operators]
+
     def integrate_material(
         self,
         u: Tensor,
@@ -317,6 +377,23 @@ class FEM(ABC):
         f = torch.zeros(self.n_elem, self.n_dim * n_nod)
         k = torch.zeros((self.n_elem, self.n_dim * n_nod, self.n_dim * n_nod))
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Averaged formulations need element-wide quantities, which
+        # take their own pass over the quadrature points. Nothing here
+        # runs for the standard element, so its cost is unchanged.
+        corrections = None
+        if self.formulation != "full":
+            if self.n_stress != 3:
+                raise NotImplementedError(
+                    "b_bar is implemented for 3D continua only."
+                )
+            if nlgeom:
+                # The correction is built on the reference configuration and
+                # would not match the deformed-configuration tangent.
+                raise NotImplementedError(
+                    "b_bar is a small-strain formulation; use nlgeom=False."
+                )
+            corrections = self.dilatational_correction()
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         for i, (w, xi) in enumerate(zip(self.etype.iweights(),
                                         self.etype.ipoints(),
                                         strict=False)):
@@ -332,6 +409,15 @@ class FEM(ABC):
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute displacement gradient increment
             H_inc = torch.einsum("...ij,...jk->...ik", B0, du)
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # b-bar: shift the volumetric part of the increment to the element
+            # average. The correction is isotropic, so it acts on the trace
+            # alone and leaves the deviatoric part exact.
+            if corrections is not None:
+                G = corrections[i]
+                shift = torch.einsum("...ia,...ai->...", G, du)
+                eye = torch.eye(self.n_stress)
+                H_inc = H_inc + shift[..., None, None] * eye
             # Update deformation gradient
             F[n, i] = F[n - 1, i] + H_inc
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -342,6 +428,15 @@ class FEM(ABC):
             # Compute element internal forces
             force_contrib = self.compute_f(detJ, B, stress[n, i].clone())
             f += w * force_contrib.reshape(-1, self.n_dim * n_nod)
+            # The modified strain map contributes a second term, without which
+            # the internal force would not be the true gradient of the energy
+            # and the element would be inconsistent rather than merely
+            # differently integrated.
+            if corrections is not None:
+                trace_stress = torch.einsum("...ii->...", stress[n, i])
+                f += w * (detJ * trace_stress)[..., None, None].squeeze(
+                    -1) * G.transpose(-1, -2).reshape(
+                    -1, self.n_dim * n_nod)
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute element stiffness matrix
             if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
@@ -350,6 +445,24 @@ class FEM(ABC):
                     "...ijpq,...qk,...il->...ljkp", ddsdde, B, B)
                 BCB = BCB.reshape(-1, self.n_dim * n_nod, self.n_dim * n_nod)
                 k += w * self.compute_k(detJ, BCB)
+                # Cross and pure terms of the modified strain map. Omitting
+                # them leaves the tangent inconsistent with the force, which
+                # costs Newton its quadratic convergence.
+                if corrections is not None:
+                    Gt = G.transpose(-1, -2).reshape(
+                        -1, self.n_dim * n_nod)
+                    c_vol1 = torch.einsum("...ikpp->...ik", ddsdde)
+                    c_vol2 = torch.einsum("...iipq->...pq", ddsdde)
+                    c_vv = torch.einsum("...iipp->...", ddsdde)
+                    lhs = torch.einsum("...ia,...im->...am", B, c_vol1)
+                    lhs = lhs.reshape(-1, self.n_dim * n_nod)
+                    rhs = torch.einsum("...pn,...pb->...bn", c_vol2, B)
+                    rhs = rhs.reshape(-1, self.n_dim * n_nod)
+                    cross = (lhs[:, :, None] * Gt[:, None, :]
+                             + Gt[:, :, None] * rhs[:, None, :]
+                             + c_vv[:, None, None] * Gt[:, :, None]
+                             * Gt[:, None, :])
+                    k += w * detJ[:, None, None] * cross
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             if nlgeom:
                 # Geometric stiffness
