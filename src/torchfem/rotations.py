@@ -2,6 +2,44 @@ import torch
 from torch import Tensor
 
 
+def polar_log(f: Tensor) -> tuple[Tensor, Tensor]:
+    """Rotation and logarithmic stretch of a deformation gradient.
+
+    Splits ``f = R U`` with ``R`` orthogonal and ``U`` symmetric
+    positive definite, and returns ``R`` together with ``ln U``. Both
+    follow from the eigendecomposition of ``C = f^T f``, which is
+    exact, batched and differentiable.
+
+    ``ln U`` is objective: superposing a rigid rotation on ``f``
+    leaves it unchanged, because the rotation cancels in ``f^T f``.
+    For an infinitesimal increment it reduces to the symmetric
+    displacement gradient, so the small-strain description is its
+    limit rather than a separate model.
+
+    Args:
+        f (Tensor): Deformation gradient of shape (..., 3, 3).
+
+    Returns:
+        tuple[Tensor, Tensor]: Orthogonal factor and logarithmic
+            stretch, both of shape (..., 3, 3).
+    """
+    cauchy_green = f.transpose(-1, -2) @ f
+    eigenvalues, eigenvectors = torch.linalg.eigh(cauchy_green)
+    # C is positive definite for any admissible deformation, so a
+    # non-positive eigenvalue means the element has inverted.
+    if bool((eigenvalues <= 0.0).any()):
+        raise ValueError(
+            'Right Cauchy-Green tensor is not positive definite: the '
+            'deformation gradient is singular or inverted.')
+    roots = torch.sqrt(eigenvalues)
+    transposed = eigenvectors.transpose(-1, -2)
+    stretch_inverse = (eigenvectors @ torch.diag_embed(1.0 / roots)
+                       @ transposed)
+    stretch_log = (eigenvectors @ torch.diag_embed(torch.log(roots))
+                   @ transposed)
+    return f @ stretch_inverse, stretch_log
+
+
 def planar_rotation(phi: float | Tensor) -> Tensor:
     """Create a planar rotation matrix with an angle phi."""
     phi = torch.as_tensor(phi)

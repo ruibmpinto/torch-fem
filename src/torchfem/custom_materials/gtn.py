@@ -54,8 +54,6 @@ Functions
 ---------
 validate_gtn_params
     Strict validation of the GTN parameter dictionary.
-polar_log
-    Rotation and logarithmic stretch of a deformation gradient.
 stress_invariants
     Hydrostatic stress, von Mises stress and deviator.
 f_star
@@ -85,6 +83,7 @@ import torch
 
 # Local
 from ..materials import IsotropicElasticity3D
+from ..rotations import polar_log
 
 #
 #                                                          Authorship & Credits
@@ -133,48 +132,6 @@ def validate_gtn_params(gtn_params):
         raise ValueError(
             f'gtn_params contains unknown keys: {unknown}.')
     return gtn_params
-# =============================================================================
-def polar_log(f):
-    """Rotation and logarithmic stretch of a deformation gradient.
-
-    Splits ``f = R U`` with ``R`` orthogonal and ``U`` symmetric
-    positive definite, and returns ``R`` together with ``ln U``. Both
-    follow from the eigendecomposition of ``C = f^T f``, which is
-    exact, batched and differentiable.
-
-    ``ln U`` is objective: superposing a rigid rotation on ``f``
-    leaves it unchanged, because the rotation cancels in ``f^T f``.
-    For an infinitesimal increment it reduces to the symmetric
-    displacement gradient, so the small-strain description is its
-    limit rather than a separate model.
-
-    Parameters
-    ----------
-    f : torch.Tensor
-        Deformation gradient of shape ``(..., 3, 3)``.
-
-    Returns
-    -------
-    rotation : torch.Tensor
-        Orthogonal factor of shape ``(..., 3, 3)``.
-    stretch_log : torch.Tensor
-        Logarithmic stretch of shape ``(..., 3, 3)``.
-    """
-    cauchy_green = f.transpose(-1, -2) @ f
-    eigenvalues, eigenvectors = torch.linalg.eigh(cauchy_green)
-    # C is positive definite for any admissible deformation, so a
-    # non-positive eigenvalue means the element has inverted.
-    if bool((eigenvalues <= 0.0).any()):
-        raise ValueError(
-            'Right Cauchy-Green tensor is not positive definite: the '
-            'deformation gradient is singular or inverted.')
-    roots = torch.sqrt(eigenvalues)
-    transposed = eigenvectors.transpose(-1, -2)
-    stretch_inverse = (eigenvectors @ torch.diag_embed(1.0 / roots)
-                       @ transposed)
-    stretch_log = (eigenvectors @ torch.diag_embed(torch.log(roots))
-                   @ transposed)
-    return f @ stretch_inverse, stretch_log
 # =============================================================================
 def stress_invariants(sigma):
     """Hydrostatic stress, von Mises stress and deviator.

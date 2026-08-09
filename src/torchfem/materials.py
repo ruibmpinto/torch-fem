@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 from torch.func import jacrev, vmap
 
+from .rotations import polar_log
 from .utils import (
     stiffness2voigt,
     strain2voigt,
@@ -397,6 +398,9 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
         max_iter (int, optional): Maximum number of iterations for the
             local Newton solver in plasticity correction. Default is
             `10`.
+        kinematics (str, optional): Kinematic description, either
+            `"small_strain"` (default) or `"corotational"`. See
+            `__init__`.
     """
 
     def __init__(
@@ -407,13 +411,44 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
         sigma_f_prime: Callable,
         tolerance: float = 1e-5,
         max_iter: int = 10,
+        kinematics: str = "small_strain",
     ):
+        """Initialize the material.
+
+        Args:
+            E: Young's modulus.
+            nu: Poisson's ratio.
+            sigma_f: Yield stress as a function of the equivalent
+                plastic strain.
+            sigma_f_prime: Derivative of `sigma_f`.
+            tolerance: Convergence tolerance of the local Newton solver.
+            max_iter: Maximum local Newton iterations.
+            kinematics: Kinematic description.
+
+                - `"small_strain"` (default): the strain increment is
+                  the symmetric part of the displacement gradient
+                  increment and the deformation gradient is ignored.
+                  This is the previous behaviour of this class.
+                - `"corotational"`: the relative deformation gradient
+                  of the increment is split into a rotation and a
+                  stretch; the stored stress is carried into the
+                  current frame and the logarithmic stretch is passed
+                  as the strain increment. The result is objective, so
+                  a superposed rigid rotation leaves the stress state
+                  unchanged. The return map itself is used unchanged.
+        """
         super().__init__(E, nu)
         self.sigma_f = sigma_f
         self.sigma_f_prime = sigma_f_prime
         self.n_state = 1
         self.tolerance = tolerance
         self.max_iter = max_iter
+        if kinematics not in ("small_strain", "corotational"):
+            raise ValueError(
+                f"Unknown kinematics '{kinematics}'. "
+                "Choose from 'small_strain' or 'corotational'."
+            )
+        self.kinematics = kinematics
 
     def vectorize(self, n_elem: int):
         """Returns a vectorized copy of the material for `n_elem` elements.
@@ -439,7 +474,7 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
             nu = self.nu.repeat(n_elem)
             return IsotropicPlasticity3D(
                 E, nu, self.sigma_f, self.sigma_f_prime,
-                self.tolerance, self.max_iter
+                self.tolerance, self.max_iter, self.kinematics
             )
 
     def step(
@@ -484,17 +519,26 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
         """
         # Second order identity tensor
         I2 = torch.eye(H_inc.shape[-1])
-        # Compute small strain tensor
-        de = 0.5 * (H_inc.transpose(-1, -2) + H_inc)
+        if self.kinematics == "small_strain":
+            de = 0.5 * (H_inc.transpose(-1, -2) + H_inc)
+            sigma_in = sigma
+        else:
+            # Relative deformation gradient of this increment, split into
+            # a rotation and a stretch.
+            f_rel = (F + H_inc) @ torch.linalg.inv(F)
+            rotation, de = polar_log(f_rel)
+            # Carry the stored stress into the current frame; the
+            # logarithmic stretch is the objective strain increment.
+            sigma_in = rotation @ sigma @ rotation.transpose(-1, -2)
 
         # Initialize solution variables
-        sigma_new = sigma.clone()
+        sigma_new = sigma_in.clone()
         state_new = state.clone()
         q = state_new[..., 0]
         ddsdde = self.C.clone()
 
         # Compute trial stress
-        s_trial = sigma + torch.einsum(
+        s_trial = sigma_in + torch.einsum(
             "...ijkl,...kl->...ij", self.C, de - de0)
 
         # Compute the deviatoric trial stress
