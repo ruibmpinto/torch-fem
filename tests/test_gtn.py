@@ -214,7 +214,7 @@ def test_dense_limit_matches_j2():
     # torch-fem J2 oracle with the identical hardening callable.
     j2 = IsotropicPlasticity3D(
         1000.0, 0.3, linear_flow_stress, linear_flow_stress_prime,
-        tolerance=1.0e-12, max_iter=50).vectorize(n_elem)
+        abstol=1.0e-12, max_iter=50).vectorize(n_elem)
     F = torch.eye(3).expand(n_elem, 3, 3)
     sigma0 = torch.zeros(n_elem, 3, 3)
     state0 = torch.zeros(n_elem, 1)

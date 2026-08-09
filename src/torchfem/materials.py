@@ -393,8 +393,12 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
             function of the equivalent plastic strain.
         sigma_f_prime (Callable): Derivative of the yield function with
             respect to the equivalent plastic strain.
-        tolerance (float, optional): Convergence tolerance for the
-            plasticity return-mapping algorithm. Default is `1e-5`.
+        abstol (float, optional): Absolute convergence tolerance of the
+            return-mapping algorithm, in stress units. Default is
+            `1e-5`.
+        reltol (float, optional): Relative convergence tolerance, taken
+            against the trial deviatoric stress norm. Default is `0.0`,
+            which leaves the test purely absolute.
         max_iter (int, optional): Maximum number of iterations for the
             local Newton solver in plasticity correction. Default is
             `10`.
@@ -409,11 +413,24 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
         nu: float | Tensor,
         sigma_f: Callable,
         sigma_f_prime: Callable,
-        tolerance: float = 1e-5,
+        abstol: float = 1e-5,
         max_iter: int = 10,
         kinematics: str = "small_strain",
+        reltol: float = 0.0,
     ):
         """Initialize the material.
+
+        The local Newton iteration stops once the yield residual falls
+        below `max(abstol, reltol * ref)`, with `ref` the trial
+        deviatoric stress norm floored at one. Both tests are available
+        and either is disabled by setting its tolerance to zero. The
+        default `reltol = 0.0` leaves the criterion purely absolute and
+        reproduces the previous behaviour exactly.
+
+        An absolute tolerance is a threshold on a dimensional quantity,
+        so it tightens or loosens with the stress scale of the problem;
+        a relative one does not. Prefer `reltol` when the same material
+        is used across stress scales.
 
         Args:
             E: Young's modulus.
@@ -421,8 +438,9 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
             sigma_f: Yield stress as a function of the equivalent
                 plastic strain.
             sigma_f_prime: Derivative of `sigma_f`.
-            tolerance: Convergence tolerance of the local Newton solver.
+            abstol: Absolute convergence tolerance, in stress units.
             max_iter: Maximum local Newton iterations.
+            reltol: Relative convergence tolerance.
             kinematics: Kinematic description.
 
                 - `"small_strain"` (default): the strain increment is
@@ -441,7 +459,8 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
         self.sigma_f = sigma_f
         self.sigma_f_prime = sigma_f_prime
         self.n_state = 1
-        self.tolerance = tolerance
+        self.abstol = abstol
+        self.reltol = reltol
         self.max_iter = max_iter
         if kinematics not in ("small_strain", "corotational"):
             raise ValueError(
@@ -474,7 +493,8 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
             nu = self.nu.repeat(n_elem)
             return IsotropicPlasticity3D(
                 E, nu, self.sigma_f, self.sigma_f_prime,
-                self.tolerance, self.max_iter, self.kinematics
+                abstol=self.abstol, max_iter=self.max_iter,
+                kinematics=self.kinematics, reltol=self.reltol
             )
 
     def step(
@@ -563,6 +583,9 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
         # Local Newton solver to find plastic strain increment
         dGamma = torch.zeros_like(f[fm])
         G = self.G[fm]
+        # Residual threshold, frozen at the trial state
+        ref = dev_norm[fm].detach().clamp(min=1.0)
+        limit = torch.clamp(self.reltol * ref, min=self.abstol)
         for _ in range(self.max_iter):
             res = (
                 dev_norm[fm] - 2.0 * G * dGamma
@@ -574,11 +597,11 @@ class IsotropicPlasticity3D(IsotropicElasticity3D):
             q[fm] += sqrt(2.0 / 3.0) * ddGamma
 
             # Check convergence for early stopping
-            if (torch.abs(res) < self.tolerance).all():
+            if (torch.abs(res) < limit).all():
                 break
 
         # Check if the local Newton iteration converged
-        if (torch.abs(res) > self.tolerance).any():
+        if (torch.abs(res) > limit).any():
             print("Local Newton iteration did not converge")
 
         # Update stress
@@ -1676,7 +1699,7 @@ class IsotropicPlasticity3DUMAT(IsotropicPlasticity3D):
     """
     def __init__(self, E, nu, sigma_f, sigma_f_prime,
                  is_analytical_tangent=False, h_pert=1e-8,
-                 tolerance=1e-5, max_iter=10):
+                 abstol=1e-5, max_iter=10, reltol=0.0):
         """Constructor.
 
         Parameters
@@ -1694,14 +1717,16 @@ class IsotropicPlasticity3DUMAT(IsotropicPlasticity3D):
             False, use forward-difference perturbation tangent.
         h_pert : float, default=1e-8
             Forward-difference step size.
-        tolerance : float, default=1e-5
-            Local Newton convergence tolerance for return map.
+        abstol : float, default=1e-5
+            Absolute local Newton tolerance for the return map.
         max_iter : int, default=10
             Maximum local Newton iterations for return map.
+        reltol : float, default=0.0
+            Relative local Newton tolerance for the return map.
         """
         super().__init__(
             E, nu, sigma_f, sigma_f_prime,
-            tolerance=tolerance, max_iter=max_iter)
+            abstol=abstol, max_iter=max_iter, reltol=reltol)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Dispatch flag and perturbation step size
         self._is_analytical_tangent = is_analytical_tangent
@@ -1727,8 +1752,8 @@ class IsotropicPlasticity3DUMAT(IsotropicPlasticity3D):
         return IsotropicPlasticity3DUMAT(
             E, nu, self.sigma_f, self.sigma_f_prime,
             is_analytical_tangent=self._is_analytical_tangent,
-            h_pert=self._h_pert,
-            tolerance=self.tolerance, max_iter=self.max_iter)
+            h_pert=self._h_pert, abstol=self.abstol,
+            max_iter=self.max_iter, reltol=self.reltol)
     # -------------------------------------------------------------------------
     def step(self, H_inc, F, sigma, state, de0):
         """Strain increment with branched tangent.
@@ -1814,6 +1839,9 @@ class IsotropicPlasticity3DUMAT(IsotropicPlasticity3D):
         n = dev[fm] / dev_norm[fm][..., None, None]
         dGamma = torch.zeros_like(f[fm])
         G = self.G[fm]
+        # Residual threshold, frozen at the trial state
+        ref = dev_norm[fm].detach().clamp(min=1.0)
+        limit = torch.clamp(self.reltol * ref, min=self.abstol)
         for _ in range(self.max_iter):
             res = (dev_norm[fm] - 2.0 * G * dGamma
                    - sqrt(2.0 / 3.0) * self.sigma_f(q[fm]))
@@ -1821,7 +1849,7 @@ class IsotropicPlasticity3DUMAT(IsotropicPlasticity3D):
                 2.0 * G + 2.0 / 3.0 * self.sigma_f_prime(q[fm]))
             dGamma += ddGamma
             q[fm] += sqrt(2.0 / 3.0) * ddGamma
-            if (torch.abs(res) < self.tolerance).all():
+            if (torch.abs(res) < limit).all():
                 break
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Update stress and state
