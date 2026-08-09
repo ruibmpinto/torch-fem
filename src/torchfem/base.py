@@ -661,6 +661,10 @@ class FEM(ABC):
             'broyden', 'jfnk', 'rand_subspace_newton',
         ] = 'newton_raphson',
         nonlinear_solver_opts: dict | None = None,
+        initial_displacement: Tensor | None = None,
+        initial_stress: Tensor | None = None,
+        initial_defgrad: Tensor | None = None,
+        initial_state: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[
         Tensor, Tensor, Tensor, Tensor, Tensor, dict] | tuple[
@@ -696,6 +700,24 @@ class FEM(ABC):
             nonlinear_solver_opts (dict, optional): Solver-specific
                 keyword arguments forwarded to the dispatcher (e.g.
                 ``{'damping': 0.5}`` for Damped Picard).
+            initial_displacement (Tensor, optional): Displacement at
+                increment 0, shape (n_nodes, n_dim). Defaults to
+                zero, i.e. starting from rest.
+            initial_stress (Tensor, optional): Stress at increment 0,
+                shape (n_int, n_elem, n_stress, n_stress). Defaults
+                to zero.
+            initial_defgrad (Tensor, optional): Deformation gradient
+                at increment 0, same shape as initial_stress.
+                Defaults to the identity.
+            initial_state (Tensor, optional): Material state at
+                increment 0, shape (n_int, n_elem, n_state).
+                Defaults to zero.
+
+                These four arguments let a caller resume from the end
+                of a previous increment instead of from rest, which
+                is what a staggered multiphysics driver needs since
+                it re-enters solve() once per coupled step. Left as
+                None they reproduce the from-rest behaviour exactly.
 
         Returns:
                 Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: Final
@@ -727,6 +749,19 @@ class FEM(ABC):
                               self.n_stress, self.n_stress)
         defgrad[:, :, :, :, :] = torch.eye(self.n_stress)
         state = torch.zeros(N, self.n_int, self.n_elem, self.material.n_state)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Seed increment 0 when the caller resumes from a previous
+        # solve rather than from rest. Every later increment is built
+        # on increment 0, so this is the only place the history has
+        # to be injected.
+        if initial_displacement is not None:
+            u[0] = initial_displacement
+        if initial_stress is not None:
+            stress[0] = initial_stress
+        if initial_defgrad is not None:
+            defgrad[0] = initial_defgrad
+        if initial_state is not None:
+            state[0] = initial_state
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize volumes if requested
         if return_volumes:
