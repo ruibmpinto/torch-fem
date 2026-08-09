@@ -95,6 +95,9 @@ class Diffusion:
         """
         # Coordinates of the nodes of every element
         nodes = self.nodes[self.elements, :]
+        # The element kernels follow the dtype of xi, and the stored
+        # quadrature points are single precision literals
+        xi = torch.as_tensor(xi, dtype=nodes.dtype, device=nodes.device)
         # Shape function derivatives in natural coordinates
         b = self.etype.B(xi)
         # Jacobian of the map from natural to physical coordinates
@@ -121,7 +124,7 @@ class Diffusion:
         """
         weights = None
         # Accumulate the quadrature sum over the element
-        for w, xi in zip(self.etype.iweights(), self.etype.ipoints(),
+        for w, xi in zip(*self.etype.integration_rule(self.nodes.dtype),
                          strict=False):
             N, _, detJ = self.eval_shape_functions(xi)
             # Volume this point contributes to each of its nodes
@@ -150,7 +153,7 @@ class Diffusion:
         operator = DiffusionOperator(conductivity, self.n_dim)
         blocks = None
         # Accumulate the quadrature sum over the element
-        for w, xi in zip(self.etype.iweights(), self.etype.ipoints(),
+        for w, xi in zip(*self.etype.integration_rule(self.nodes.dtype),
                          strict=False):
             _, B, detJ = self.eval_shape_functions(xi)
             contribution = operator.assemble_element_stiffness(
@@ -292,6 +295,66 @@ class Diffusion:
         return sparse_solve(matrix, rhs, None, 1e-10, None, method, None,
                             cached_solve, False)
 
+    def flux(self, field: Tensor,
+             conductivity: Tensor) -> tuple[Tensor, Tensor]:
+        """Flux of a nodal field at the integration points.
+
+        Fourier's and Ohm's laws share the form ``q = -k grad(phi)``, so
+        this returns heat flux, current density or diffusive flux
+        according to what the field and the conductivity are.
+
+        Args:
+            field (Tensor): Nodal field of shape (n_nod,).
+            conductivity (Tensor): Per-element conductivity of shape
+                (n_elem,).
+
+        Returns:
+            tuple[Tensor, Tensor]: Flux of shape (n_int, n_elem, n_dim)
+                and the integration weights of shape (n_int, n_elem).
+        """
+        gradients, weights = self.gradient(field)
+        # Flux runs down the gradient, hence the sign
+        return -conductivity[None, :, None] * gradients, weights
+
+    def power(self, field: Tensor, conductivity: Tensor) -> Tensor:
+        """Total dissipated power of a nodal field.
+
+        Evaluates ``phi^T K phi`` on the unconstrained operator, which
+        is the dissipation the field actually carries. Taking it from
+        the constrained operator instead would miss the boundary
+        couplings that elimination removed.
+
+        Args:
+            field (Tensor): Nodal field of shape (n_nod,).
+            conductivity (Tensor): Per-element conductivity of shape
+                (n_elem,).
+
+        Returns:
+            Tensor: Scalar dissipated power.
+        """
+        return field @ self.reaction(field, conductivity)
+
+    def reaction(self, field: Tensor, conductivity: Tensor) -> Tensor:
+        """Nodal reaction ``K phi`` of a nodal field.
+
+        Summing this over a constrained node set gives the total flow
+        through that set, which is how a current or a heat rate is
+        recovered from a solved potential.
+
+        Args:
+            field (Tensor): Nodal field of shape (n_nod,).
+            conductivity (Tensor): Per-element conductivity of shape
+                (n_elem,).
+
+        Returns:
+            Tensor: Nodal reaction of shape (n_nod,).
+        """
+        matrix = self.stiffness(conductivity).coalesce()
+        rows, cols = matrix.indices()
+        # Sparse matrix-vector product, kept differentiable
+        return torch.zeros_like(field).index_add(
+            0, rows, matrix.values() * field[cols])
+
     def gradient(self, field: Tensor) -> tuple[Tensor, Tensor]:
         """Cartesian gradient of a nodal field at the element level.
 
@@ -308,7 +371,7 @@ class Diffusion:
         gradients = []
         weights = []
         # The gradient lives at the integration points, not the nodes
-        for w, xi in zip(self.etype.iweights(), self.etype.ipoints(),
+        for w, xi in zip(*self.etype.integration_rule(self.nodes.dtype),
                          strict=False):
             _, B, detJ = self.eval_shape_functions(xi)
             gradients.append(torch.einsum("eik,ek->ei", B, field_elem))

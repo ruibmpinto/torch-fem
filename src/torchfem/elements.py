@@ -31,6 +31,30 @@ class Element(ABC):
         """Natural coordinates of element nodes."""
         pass
 
+    def integration_rule(self, dtype: torch.dtype):
+        """Integration weights and points at a given dtype.
+
+        The rules are written as Python floats but materialised at the
+        global default dtype, so a double-precision mesh has to build
+        them rather than cast them: a weight such as 1/6 has no exact
+        single-precision form, and casting cannot recover digits it
+        never carried. Integrating a tetrahedron off a single-precision
+        rule costs about 1e-8 relative on the element volume.
+
+        Args:
+            dtype (torch.dtype): Dtype to build the rule at, normally
+                that of the mesh coordinates.
+
+        Returns:
+            tuple[Tensor, Tensor]: Weights and natural coordinates.
+        """
+        previous = torch.get_default_dtype()
+        torch.set_default_dtype(dtype)
+        try:
+            return self.iweights(), self.ipoints()
+        finally:
+            torch.set_default_dtype(previous)
+
 
 class Bar1(Element):
     def __init__(self):
