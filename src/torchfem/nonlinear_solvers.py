@@ -188,9 +188,15 @@ def _print_iter(method: str, n_iter: int, r_norm: Tensor) -> None:
 def _check_converged(
     r_norm: Tensor, r_norm_0: Tensor, atol: float, rtol: float,
 ) -> bool:
-    """Return True if absolute or relative tolerance is satisfied."""
+    """Return True if absolute or relative tolerance is satisfied.
+
+    The comparison is non-strict so that an exactly zero residual
+    counts as converged: a problem in which every degree of freedom is
+    prescribed has nothing left to solve, and a strict test would run
+    it to the iteration cap and then report failure.
+    """
     return bool(
-        (r_norm < atol) or (r_norm < rtol * r_norm_0)
+        (r_norm <= atol) or (r_norm <= rtol * r_norm_0)
     )
 
 
