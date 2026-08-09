@@ -31,6 +31,7 @@ except ImportError:
     pass
 
 try:
+    from sksparse.cholmod import analyze as cholmod_analyze
     from sksparse.cholmod import cholesky as cholmod_cholesky
 
     available_backends.append("cholmod")
@@ -54,6 +55,9 @@ class CachedSolve:
 
         self.previous_x = previous_x
         self.previous_grad = previous_grad
+        # CHOLMOD symbolic analysis and the pattern it was built for.
+        self.symbolic = None
+        self.pattern = None
 
     def update_grad(self, grad):
         self.previous_grad = (
@@ -62,6 +66,37 @@ class CachedSolve:
 
     def update_x(self, x):
         self.previous_x = x.detach().clone() if x is not None else None
+
+    def cholmod_factor(self, A_csc):
+        """Factorise an SPD matrix, reusing the symbolic analysis.
+
+        A sequence of operators sharing one sparsity pattern needs only
+        a single fill-reducing ordering and elimination tree; every
+        later factorisation is then a numeric update on that pattern.
+        This is the case whenever a coefficient field is iterated on a
+        fixed mesh, as in a load cycle or a parameter fit, where the
+        symbolic analysis would otherwise dominate the solve.
+
+        The pattern is checked on every call, so passing an operator
+        with a different pattern re-analyses rather than returning a
+        wrong factorisation.
+
+        Args:
+            A_csc (scipy.sparse.csc_matrix): SPD matrix to factorise.
+
+        Returns:
+            sksparse.cholmod.Factor: Factor of ``A_csc``. The same
+                object is returned each time and is updated in place,
+                so a caller that needs a factorisation to survive
+                later calls must re-factorise from its own values.
+        """
+        pattern = (A_csc.shape[0], A_csc.indptr.tobytes(),
+                   A_csc.indices.tobytes())
+        if self.symbolic is None or self.pattern != pattern:
+            self.symbolic = cholmod_analyze(A_csc)
+            self.pattern = pattern
+        self.symbolic.cholesky_inplace(A_csc)
+        return self.symbolic
 
 
 class Solve(Function):
@@ -294,7 +329,9 @@ class Solve(Function):
             # method asserts that A is symmetric positive definite;
             # CHOLMOD raises if it is not, which is a clearer failure
             # than an iterative method converging to the wrong answer.
-            factor = cholmod_cholesky(A_np.tocsc())
+            # The cache reuses the symbolic analysis across solves that
+            # share a sparsity pattern.
+            factor = cached_solve.cholmod_factor(A_np.tocsc())
             x_xp = factor(b_np)
         elif method == "minres":
             # AMG preconditioner with Jacobi smoother
