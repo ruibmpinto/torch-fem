@@ -88,6 +88,11 @@ class FEM(ABC):
         self.n_dim = nodes.shape[1]
         self.n_elem = len(self.elements)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Precision and placement of the problem, taken from the mesh so
+        # that the work arrays never depend on the global default dtype
+        self.dtype = nodes.dtype
+        self.device = nodes.device
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize load variables
         self._forces = torch.zeros_like(nodes)
         self._displacements = torch.zeros_like(nodes)
@@ -253,7 +258,8 @@ class FEM(ABC):
         Compute null space matrix representing rigid body modes.
         """
         if self.n_dim == 3:
-            B = torch.zeros((self.n_dofs, 6))
+            B = torch.zeros((self.n_dofs, 6), dtype=self.dtype,
+                            device=self.device)
             B[0::3, 0] = 1
             B[1::3, 1] = 1
             B[2::3, 2] = 1
@@ -264,13 +270,43 @@ class FEM(ABC):
             B[0::3, 5] = -self.nodes[:, 1]
             B[1::3, 5] = self.nodes[:, 0]
         else:
-            B = torch.zeros((self.n_dofs, 3))
+            B = torch.zeros((self.n_dofs, 3), dtype=self.dtype,
+                            device=self.device)
             B[0::2, 0] = 1
             B[1::2, 1] = 1
             B[1::2, 2] = -self.nodes[:, 0]
             B[0::2, 2] = self.nodes[:, 1]
         return B
     # -------------------------------------------------------------------------
+    def initialize_history(self, n_increments: int, n_state: int):
+        """Allocate the per-increment history of a solve.
+
+        Args:
+            n_increments (int): Number of load increments to store.
+            n_state (int): Number of state variables per integration
+                point.
+
+        Returns:
+            tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: Displacement,
+                force, stress, deformation gradient and state history.
+                The deformation gradient starts at the identity, the
+                rest at zero.
+        """
+        shape = (n_increments, self.n_int, self.n_elem, self.n_stress,
+                 self.n_stress)
+        u = torch.zeros(n_increments, self.n_nod, self.n_dim,
+                        dtype=self.dtype, device=self.device)
+        f = torch.zeros_like(u)
+        stress = torch.zeros(shape, dtype=self.dtype, device=self.device)
+        defgrad = torch.zeros_like(stress)
+        # An undeformed body starts at the identity, not at zero
+        defgrad[:] = torch.eye(self.n_stress, dtype=self.dtype,
+                               device=self.device)
+        state = torch.zeros(n_increments, self.n_int, self.n_elem,
+                            n_state, dtype=self.dtype,
+                            device=self.device)
+        return u, f, stress, defgrad, state
+
     def k0(self) -> Tensor:
         """Compute element stiffness matrix for zero strain.
 
@@ -280,16 +316,22 @@ class FEM(ABC):
         """
         u = torch.zeros_like(self.nodes)
         F = torch.zeros(2, self.n_int, self.n_elem, self.n_stress,
-                        self.n_stress)
+                        self.n_stress, dtype=self.dtype,
+                        device=self.device)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        F[:, :, :, :, :] = torch.eye(self.n_stress)
+        F[:, :, :, :, :] = torch.eye(self.n_stress, dtype=self.dtype,
+                                     device=self.device)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         s = torch.zeros(2, self.n_int, self.n_elem, self.n_stress,
-                        self.n_stress)
+                        self.n_stress, dtype=self.dtype,
+                        device=self.device)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        a = torch.zeros(2, self.n_int, self.n_elem, self.material.n_state)
+        a = torch.zeros(2, self.n_int, self.n_elem,
+                        self.material.n_state, dtype=self.dtype,
+                        device=self.device)
         du = torch.zeros_like(self.nodes)
-        de0 = torch.zeros(self.n_elem, self.n_stress, self.n_stress)
+        de0 = torch.zeros(self.n_elem, self.n_stress, self.n_stress,
+                          dtype=self.dtype, device=self.device)
         self.K = torch.empty(0)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         k, _ = self.integrate_material(u, F, s, a, 1, du, de0, False)
@@ -324,7 +366,7 @@ class FEM(ABC):
         operators = []
         volume = None
         weighted = None
-        for w, xi in zip(self.etype.iweights(), self.etype.ipoints(),
+        for w, xi in zip(*self.etype.integration_rule(self.nodes.dtype),
                          strict=False):
             _, B, detJ = self.eval_shape_functions(xi, u)
             operators.append(B)
@@ -384,8 +426,11 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize nodal force and stiffness
         n_nod = self.etype.nodes
-        f = torch.zeros(self.n_elem, self.n_dim * n_nod)
-        k = torch.zeros((self.n_elem, self.n_dim * n_nod, self.n_dim * n_nod))
+        f = torch.zeros(self.n_elem, self.n_dim * n_nod, dtype=self.dtype,
+                        device=self.device)
+        k = torch.zeros(self.n_elem, self.n_dim * n_nod,
+                        self.n_dim * n_nod, dtype=self.dtype,
+                        device=self.device)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Averaged formulations need element-wide quantities, which
         # take their own pass over the quadrature points. Nothing here
@@ -402,9 +447,9 @@ class FEM(ABC):
             corrections = self.dilatational_correction(
                 u_trial if nlgeom else 0.0)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        for i, (w, xi) in enumerate(zip(self.etype.iweights(),
-                                        self.etype.ipoints(),
-                                        strict=False)):
+        for i, (w, xi) in enumerate(zip(
+                *self.etype.integration_rule(self.nodes.dtype),
+                strict=False)):
             # Compute gradient operators
             _, B0, detJ0 = self.eval_shape_functions(xi)
             if nlgeom:
@@ -424,7 +469,8 @@ class FEM(ABC):
             if corrections is not None:
                 G = corrections[i]
                 shift = torch.einsum("...ia,...ai->...", G, du)
-                eye = torch.eye(self.n_stress)
+                eye = torch.eye(self.n_stress, dtype=self.dtype,
+                                device=self.device)
                 H_inc = H_inc + shift[..., None, None] * eye
             # Update deformation gradient
             F[n, i] = F[n - 1, i] + H_inc
@@ -635,11 +681,13 @@ class FEM(ABC):
         """
         # Default field is ones to integrate volume
         if field is None:
-            field = torch.ones(self.n_nod)
+            field = torch.ones(self.n_nod, dtype=self.dtype,
+                               device=self.device)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Integrate
-        res = torch.zeros(len(self.elements))
-        for w, xi in zip(self.etype.iweights(), self.etype.ipoints(),
+        res = torch.zeros(len(self.elements), dtype=self.dtype,
+                          device=self.device)
+        for w, xi in zip(*self.etype.integration_rule(self.nodes.dtype),
                          strict=False):
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Evalute shale functions
@@ -663,7 +711,8 @@ class FEM(ABC):
         """
         # Initialize sparse matrix
         size = (self.n_dofs, self.n_dofs)
-        K = torch.empty(size, layout=torch.sparse_coo)
+        K = torch.empty(size, layout=torch.sparse_coo, dtype=self.dtype,
+                        device=self.device)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Build matrix in chunks to prevent excessive memory usage
         chunks = 4
@@ -710,7 +759,8 @@ class FEM(ABC):
         """
 
         # Initialize force vector
-        F = torch.zeros(self.n_dofs)
+        F = torch.zeros(self.n_dofs, dtype=self.dtype,
+                        device=self.device)
 
         # Ravel indices and values
         indices = self.idx.ravel()
@@ -865,14 +915,8 @@ class FEM(ABC):
         con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize variables to be computed
-        u = torch.zeros(N, self.n_nod, self.n_dim)
-        f = torch.zeros(N, self.n_nod, self.n_dim)
-        stress = torch.zeros(N, self.n_int, self.n_elem,
-                             self.n_stress, self.n_stress)
-        defgrad = torch.zeros(N, self.n_int, self.n_elem,
-                              self.n_stress, self.n_stress)
-        defgrad[:, :, :, :, :] = torch.eye(self.n_stress)
-        state = torch.zeros(N, self.n_int, self.n_elem, self.material.n_state)
+        u, f, stress, defgrad, state = self.initialize_history(
+            N, self.material.n_state)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Seed increment 0 when the caller resumes from a previous
         # solve rather than from rest. Every later increment is built
@@ -889,7 +933,8 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize volumes if requested
         if return_volumes:
-            volumes = torch.zeros(N, self.n_elem)
+            volumes = torch.zeros(N, self.n_elem, dtype=self.dtype,
+                                  device=self.device)
             # Compute initial volume for increment 0
             # Default field is ones to integrate volume
             volumes[0] = self.integrate_field()
@@ -1067,12 +1112,15 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize nodal force and stiffness
         n_nod = self.etype.nodes
-        f = torch.zeros(self.n_elem, self.n_dim * n_nod)
-        k = torch.zeros((self.n_elem, self.n_dim * n_nod, self.n_dim * n_nod))
+        f = torch.zeros(self.n_elem, self.n_dim * n_nod, dtype=self.dtype,
+                        device=self.device)
+        k = torch.zeros(self.n_elem, self.n_dim * n_nod,
+                        self.n_dim * n_nod, dtype=self.dtype,
+                        device=self.device)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        for i, (w, xi) in enumerate(zip(self.etype.iweights(),
-                                        self.etype.ipoints(),
-                                        strict=False)):
+        for i, (w, xi) in enumerate(zip(
+                *self.etype.integration_rule(self.nodes.dtype),
+                strict=False)):
             # Compute gradient operators
             _, B0, detJ0 = self.eval_shape_functions(xi)
             if nlgeom:
@@ -1283,18 +1331,13 @@ class FEM(ABC):
         con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize variables to be computed
-        u = torch.zeros(N, self.n_nod, self.n_dim)
-        f = torch.zeros(N, self.n_nod, self.n_dim)
-        stress = torch.zeros(N, self.n_int, self.n_elem,
-                             self.n_stress, self.n_stress)
-        defgrad = torch.zeros(N, self.n_int, self.n_elem,
-                              self.n_stress, self.n_stress)
-        defgrad[:, :, :, :, :] = torch.eye(self.n_stress)
-        state = torch.zeros(N, self.n_int, self.n_elem, msc_variables)
+        u, f, stress, defgrad, state = self.initialize_history(
+            N, msc_variables)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize volumes if requested
         if return_volumes:
-            volumes = torch.zeros(N, self.n_elem)
+            volumes = torch.zeros(N, self.n_elem, dtype=self.dtype,
+                                  device=self.device)
             # Compute initial volume for increment 0
             # Default field is ones to integrate volume
             volumes[0] = self.integrate_field()
@@ -1972,18 +2015,13 @@ class FEM(ABC):
         con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize variables to be computed
-        u = torch.zeros(N, self.n_nod, self.n_dim)
-        f = torch.zeros(N, self.n_nod, self.n_dim)
-        stress = torch.zeros(N, self.n_int, self.n_elem,
-                             self.n_stress, self.n_stress)
-        defgrad = torch.zeros(N, self.n_int, self.n_elem,
-                              self.n_stress, self.n_stress)
-        defgrad[:, :, :, :, :] = torch.eye(self.n_stress)
-        state = torch.zeros(N, self.n_int, self.n_elem, self.material.n_state)
+        u, f, stress, defgrad, state = self.initialize_history(
+            N, self.material.n_state)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Initialize volumes if requested
         if return_volumes:
-            volumes = torch.zeros(N, self.n_elem)
+            volumes = torch.zeros(N, self.n_elem, dtype=self.dtype,
+                                  device=self.device)
             # Compute initial volume for increment 0
             volumes[0] = self.integrate_field()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

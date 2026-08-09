@@ -110,6 +110,48 @@ class Diffusion:
         B = torch.einsum("jkl,lm->jkm", torch.linalg.inv(J), b)
         return self.etype.N(xi), B, detJ
 
+    def integration_weights(self) -> Tensor:
+        """Volume each integration point represents.
+
+        Pure geometry, so this also serves a field carried at the
+        integration points of the same mesh by another physics, such as
+        a void fraction stored per point by a solid solve.
+
+        Returns:
+            Tensor: Weights of shape (n_int, n_elem), summing per
+                element to the element volume.
+        """
+        weights = []
+        for w, xi in zip(*self.etype.integration_rule(self.nodes.dtype),
+                         strict=False):
+            _, _, detJ = self.eval_shape_functions(xi)
+            weights.append(w * detJ)
+        return torch.stack(weights)
+
+    def element_average(self, field: Tensor) -> Tensor:
+        """Volume-weighted average of a point field over each element.
+
+        A distorted element weights its points by the volume each
+        actually represents, which a plain mean would not.
+
+        Args:
+            field (Tensor): Field of shape (n_int, n_elem, ...).
+
+        Returns:
+            Tensor: Element values of shape (n_elem, ...).
+        """
+        weights = self.integration_weights()
+        if field.shape[:2] != weights.shape:
+            raise ValueError(
+                f"field has shape {tuple(field.shape[:2])}, expected "
+                f"{tuple(weights.shape)}."
+            )
+        # Normalise per element, then broadcast over trailing axes
+        shares = weights / weights.sum(dim=0, keepdim=True)
+        shares = shares.reshape(*weights.shape,
+                                *([1] * (field.dim() - 2)))
+        return (field * shares).sum(dim=0)
+
     def integrate_shape_functions(self) -> Tensor:
         """Integral of every shape function over its element.
 
