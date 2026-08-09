@@ -30,6 +30,13 @@ try:
 except ImportError:
     pass
 
+try:
+    from sksparse.cholmod import cholesky as cholmod_cholesky
+
+    available_backends.append("cholmod")
+except ImportError:
+    pass
+
 
 class CachedSolve:
     def __init__(self, previous_x=None, previous_grad=None):
@@ -110,11 +117,11 @@ class Solve(Function):
 
         # Check the input method
         if method is not None and method not in [
-            "spsolve", "minres", "cg", "pardiso"
+            "spsolve", "minres", "cg", "pardiso", "cholmod"
         ]:
             raise ValueError(
-                f"Method {method} is not supported. "
-                "Choose from 'spsolve', 'minres', 'cg', or 'pardiso'."
+                f"Method {method} is not supported. Choose from "
+                "'spsolve', 'minres', 'cg', 'pardiso', or 'cholmod'."
             )
 
         # Move to requested device, if available
@@ -221,6 +228,8 @@ class Solve(Function):
             x0_cp = None
         if method == "pardiso":
             raise RuntimeError("Pardiso backend is not available on GPU.")
+        elif method == "cholmod":
+            raise RuntimeError("CHOLMOD backend is not available on GPU.")
         elif method == "spsolve":
             x_xp = cupy_spsolve(A_cp, b_cp)
         elif method == "minres":
@@ -273,6 +282,20 @@ class Solve(Function):
             x_xp = x_rcm[inv_rcm_order]
         elif method == "spsolve":
             x_xp = scipy_spsolve(A_np, b_np)
+        elif method == "cholmod":
+            if "cholmod" not in available_backends:
+                raise RuntimeError(
+                    "CHOLMOD is not available.\n\n"
+                    "Please install scikit-sparse separately:\n"
+                    "> pip install scikit-sparse"
+                )
+            # Sparse Cholesky. Exact to round-off, and cheaper than a
+            # general LU because it exploits symmetry. Choosing this
+            # method asserts that A is symmetric positive definite;
+            # CHOLMOD raises if it is not, which is a clearer failure
+            # than an iterative method converging to the wrong answer.
+            factor = cholmod_cholesky(A_np.tocsc())
+            x_xp = factor(b_np)
         elif method == "minres":
             # AMG preconditioner with Jacobi smoother
             if M is None:
