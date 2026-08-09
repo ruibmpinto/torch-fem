@@ -38,7 +38,9 @@ class Solid(FEM):
         self.n_stress = 3
         self.n_int = len(self.etype.iweights())
 
-        # Initialize external strain
+        # Initialize external strain. Shape (n_elem, 3, 3) is uniform within
+        # each element; assign (n_int, n_elem, 3, 3) instead to prescribe one
+        # value per integration point.
         self.ext_strain = torch.zeros(self.n_elem, 3, 3)
 
     def eval_shape_functions(

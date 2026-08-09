@@ -296,20 +296,26 @@ class FEM(ABC):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         return k
     # -------------------------------------------------------------------------
-    def dilatational_correction(self):
-        """Correction operators of the averaged formulations.
+    def dilatational_correction(self, u: Tensor | float = 0.0):
+        """Correction operators of the averaged formulation.
 
-        Returns ``G = (B_mean - B) / 3`` at every quadrature point,
-        where ``B_mean`` is the volume-averaged gradient operator of
-        the element. Contracting ``G`` with a nodal displacement gives
-        the amount by which the pointwise volumetric strain has to be
-        shifted to equal the element-averaged one, which is what the
-        b-bar formulation replaces.
+        Returns ``G = (B_mean - B) / 3`` at every quadrature point, where
+        ``B_mean`` is the volume-averaged gradient operator of the element.
+        Contracting ``G`` with a nodal displacement gives the amount by which
+        the pointwise volumetric strain has to be shifted to equal the
+        element-averaged one, which is what b-bar replaces.
 
-        Obtaining the average needs its own pass over the quadrature
-        points, since it is not known until every point has been
-        visited; that is why this cannot be folded into the main
-        integration loop.
+        The average needs its own pass over the quadrature points, since it is
+        not known until every point has been visited; that is why it cannot be
+        folded into the integration loop.
+
+        Args:
+            u (Tensor or float): Displacement defining the configuration on
+                which the operators are evaluated. The default is the
+                reference configuration. Under nlgeom the force and tangent
+                are integrated over the deformed configuration, so the
+                correction has to be built there too, or the modified strain
+                map and its linearisation refer to different geometries.
 
         Returns:
             list[Tensor]: One correction operator of shape
@@ -320,7 +326,7 @@ class FEM(ABC):
         weighted = None
         for w, xi in zip(self.etype.iweights(), self.etype.ipoints(),
                          strict=False):
-            _, B, detJ = self.eval_shape_functions(xi)
+            _, B, detJ = self.eval_shape_functions(xi, u)
             operators.append(B)
             contribution = w * detJ
             if weighted is None:
@@ -356,8 +362,12 @@ class FEM(ABC):
                 (n_increments, n_int, n_elem, n_state).
             n (int): Current increment number.
             du (Tensor): Displacement increment vector of shape (n_dofs,).
-            de0 (Tensor): External strain increment of shape (n_elem,
-                n_stress, n_stress).
+            de0 (Tensor): External strain increment, either of shape
+                (n_elem, n_stress, n_stress), uniform within each element,
+                or (n_int, n_elem, n_stress, n_stress), one value per
+                integration point. The second form is needed when the
+                external field varies inside an element, as a thermal strain
+                does wherever the gradient is steep relative to the mesh.
             nlgeom (bool): Whether to use nonlinear geometry.
 
         Returns:
@@ -386,13 +396,11 @@ class FEM(ABC):
                 raise NotImplementedError(
                     "b_bar is implemented for 3D continua only."
                 )
-            if nlgeom:
-                # The correction is built on the reference configuration and
-                # would not match the deformed-configuration tangent.
-                raise NotImplementedError(
-                    "b_bar is a small-strain formulation; use nlgeom=False."
-                )
-            corrections = self.dilatational_correction()
+            # Built on the configuration the force and tangent are integrated
+            # over, so that the modified strain map and its linearisation
+            # refer to the same geometry.
+            corrections = self.dilatational_correction(
+                u_trial if nlgeom else 0.0)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         for i, (w, xi) in enumerate(zip(self.etype.iweights(),
                                         self.etype.ipoints(),
@@ -421,9 +429,11 @@ class FEM(ABC):
             # Update deformation gradient
             F[n, i] = F[n - 1, i] + H_inc
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Evaluate material response
+            # Evaluate material response. A 4D de0 holds one external strain
+            # per integration point, so this point takes its own slice.
+            de0_i = de0[i] if de0.dim() == 4 else de0
             stress[n, i], state[n, i], ddsdde = self.material.step(
-                H_inc, F[n - 1, i], stress[n - 1, i], state[n - 1, i], de0)
+                H_inc, F[n - 1, i], stress[n - 1, i], state[n - 1, i], de0_i)
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Compute element internal forces
             force_contrib = self.compute_f(detJ, B, stress[n, i].clone())
@@ -510,7 +520,8 @@ class FEM(ABC):
         stress_fe = stress[:, :, fe_indices].clone()
         state_fe = state[
             :, :, fe_indices].clone()
-        de0_fe = de0[fe_indices]
+        # Elements are the second axis of a 4D de0, the first of a 3D one.
+        de0_fe = de0[:, fe_indices] if de0.dim() == 4 else de0[fe_indices]
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Save original attributes
         orig_elements = self.elements
