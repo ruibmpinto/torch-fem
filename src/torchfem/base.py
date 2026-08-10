@@ -848,7 +848,13 @@ class FEM(ABC):
         Args:
             increments (Tensor): Load increment stepping.
             max_iter (int): Maximum nonlinear iterations per increment.
-            rtol (float): Relative residual tolerance.
+            rtol (float): Relative residual tolerance. Under
+                ``'newton_raphson'`` each increment starts from an
+                admissible predictor (the increment linearized at the
+                last converged state, prescribed displacements imposed
+                through the linear system), and ``rtol`` multiplies the
+                norm of that linearized residual rather than the
+                residual of the first iterate.
             atol (float): Absolute residual tolerance.
             stol (float): Solver tolerance for iterative linear methods.
             verbose (bool): Print iteration information.
@@ -1004,6 +1010,44 @@ class FEM(ABC):
                     cached_solve, update_cache,
                 )
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Admissible predictor (Newton path). Writing the prescribed
+            # increment into the unknown and integrating puts the whole
+            # increment into the element row at the constrained boundary
+            # (a strain jump of span/element-size times the nominal
+            # step), which a path-dependent material with a strict local
+            # solver rightly refuses to integrate. The increment is
+            # instead linearized at the last converged state: one
+            # integration at du = 0 (always admissible) gives the
+            # tangent and the internal force, the prescribed values
+            # enter through the element-level lift force k @ du_lift,
+            # and the linear solve distributes the increment smoothly
+            # BEFORE the material sees it. The norm of the linearized
+            # residual is the convergence reference the relative
+            # tolerance multiplies: it matches the first-iteration
+            # residual of the previous scheme in the elastic limit, and
+            # stays meaningful when the predictor already solves the
+            # increment, where the measured residual collapses to
+            # round-off and could never anchor a relative test.
+            if nonlinear_solver == 'newton_raphson':
+                self.K = torch.empty(0)
+                du_lift = torch.zeros_like(du)
+                du_lift[con] = DU[con]
+                k_pred, f_pred = self.integrate_material(
+                    u, defgrad, stress, state, n,
+                    torch.zeros_like(du), de0, nlgeom)
+                self.K = self.assemble_stiffness(k_pred, con)
+                lift_elem = du_lift.view(
+                    -1, self.n_dim)[self.elements].reshape(
+                    self.n_elem, -1)
+                f_lift = self.assemble_force(torch.einsum(
+                    '...ij,...j->...i', k_pred, lift_elem))
+                r_pred = self.assemble_force(f_pred) + f_lift - F_ext
+                r_pred[con] = 0.0
+                r_ref = float(torch.linalg.norm(r_pred))
+                du = du_lift - linsolve_fn(self.K, r_pred)
+            else:
+                r_ref = None
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Run the requested nonlinear solver.
             opts = (nonlinear_solver_opts or {}).copy()
             try:
@@ -1017,6 +1061,7 @@ class FEM(ABC):
                     verbose=verbose,
                     return_resnorm=return_resnorm,
                     linsolve_fn=linsolve_fn,
+                    r_norm_ref=r_ref,
                     **opts,
                 )
             except Exception:

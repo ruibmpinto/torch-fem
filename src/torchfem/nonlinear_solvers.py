@@ -16,7 +16,10 @@ equation ``r(u) = 0`` of the FEM problem. Six methods are supported:
   finite-difference batched JVPs.
 
 All methods share the same exit contract: the iteration converges
-when ``||r(u)|| <= max(atol, rtol * ||r(u_0)||)``; on failure to
+when ``||r(u)|| <= max(atol, rtol * ||r(u_0)||)``. The Newton solver
+alone accepts an external reference ``r_norm_ref`` replacing
+``||r(u_0)||`` in that test; passing it with any other method raises
+``ValueError``. On failure to
 converge within ``max_iter`` they raise a generic ``Exception`` with
 message containing ``'iteration did not converge.'`` so that the
 adaptive sub-incrementation in ``Simulation.run`` continues to handle
@@ -72,6 +75,7 @@ def solve_nonlinear(
     verbose: bool = False,
     return_resnorm: bool = False,
     linsolve_fn: Optional[Callable] = None,
+    r_norm_ref: Optional[float] = None,
     **method_opts,
 ) -> Tuple[Tensor, Optional[list]]:
     """Dispatch to the requested nonlinear solver.
@@ -99,6 +103,18 @@ def solve_nonlinear(
         linsolve_fn (callable, optional): Linear solve closure with
             signature ``(K, r) -> du_step``. Required for
             ``'newton_raphson'``; ignored otherwise.
+        r_norm_ref (float, optional): External reference for the
+            relative convergence test: when given, an iterate
+            converges at ``||r|| <= max(atol, rtol * r_norm_ref)``
+            instead of measuring the reference off the first
+            iterate. The caller passes the norm of the linearized
+            incremental residual, which stays meaningful when a
+            predictor already solves the increment and the measured
+            first residual collapses to round-off, where a relative
+            test anchored on it could never be satisfied. ``None``
+            keeps the previous behaviour. Supported by
+            ``'newton_raphson'`` only; any other method raises
+            ``ValueError``.
         **method_opts: Solver-specific keyword arguments. See the
             individual ``_solve_*`` docstrings.
 
@@ -117,12 +133,20 @@ def solve_nonlinear(
             f'Unknown nonlinear solver method: {method!r}. '
             f'Must be one of {sorted(_VALID_METHODS)}.'
         )
+    # The external convergence reference is implemented for the
+    # Newton solver only; refusing it elsewhere is explicit, so no
+    # caller can believe it is in effect when it is ignored.
+    if r_norm_ref is not None and method != 'newton_raphson':
+        raise ValueError(
+            "r_norm_ref is only supported by the "
+            "'newton_raphson' solver."
+        )
     if method == 'newton_raphson':
         return _solve_newton_raphson(
             residual_jacobian_fn, u0,
             max_iter=max_iter, rtol=rtol, atol=atol,
             verbose=verbose, return_resnorm=return_resnorm,
-            linsolve_fn=linsolve_fn,
+            linsolve_fn=linsolve_fn, r_norm_ref=r_norm_ref,
             **method_opts,
         )
     if method == 'damped_picard':
@@ -238,6 +262,7 @@ def _solve_newton_raphson(
     verbose: bool = False,
     return_resnorm: bool = False,
     linsolve_fn: Optional[Callable] = None,
+    r_norm_ref: Optional[float] = None,
 ) -> Tuple[Tensor, Optional[list]]:
     """Classical Newton-Raphson with consistent tangent.
 
@@ -254,6 +279,9 @@ def _solve_newton_raphson(
         linsolve_fn (callable): Linear solve closure
             ``(K, r) -> du_step`` returning the solution of
             ``K du_step = r``. Required.
+        r_norm_ref (float, optional): External reference for the
+            relative test; the first-iterate residual norm when
+            None. See ``solve_nonlinear``.
 
     Returns:
         Tuple[Tensor, list | None]: Converged ``du`` and residual
@@ -269,12 +297,12 @@ def _solve_newton_raphson(
         )
     history = [] if return_resnorm else None
     u = u0
-    r_norm_0 = None
+    r_norm_0 = r_norm_ref
     for i in range(max_iter):
         r, K, _ = residual_jacobian_fn(u, need_jacobian=True)
         r_norm = _residual_norm(r)
         _maybe_record(history, r_norm)
-        if i == 0:
+        if i == 0 and r_norm_0 is None:
             r_norm_0 = r_norm
         if verbose:
             _print_iter('newton_raphson', i + 1, r_norm)
