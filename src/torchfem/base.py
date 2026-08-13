@@ -12,7 +12,7 @@ from torch import Tensor
 
 from .elements import Element, Hexa1, Hexa2, Quad1, Quad2
 from .materials import Material
-from .nonlinear_solvers import solve_nonlinear
+from .nonlinear_solvers import ConvergenceError, solve_nonlinear
 from .sparse import CachedSolve, sparse_solve
 
 is_import_graphorge = (
@@ -521,15 +521,18 @@ class FEM(ABC):
                     k += w * detJ[:, None, None] * cross
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             if nlgeom:
-                # Geometric stiffness
+                # Geometric stiffness. The scalar B_l . sigma . B_k
+                # couples nodes l and k identically in every spatial
+                # direction, so it belongs on all n_dim diagonal
+                # sub-blocks: kg[l*d + a, k*d + b] = delta_ab BSB[l,k].
                 BSB = torch.einsum(
                     "...iq,...qk,...il->...lk", stress[n, i].clone(), B, B
                 )
-                zeros = torch.zeros_like(BSB)
-                kg = torch.stack([BSB] + (self.n_dim - 1) * [zeros], dim=-1)
-                kg = kg.reshape(-1, n_nod, self.n_dim * n_nod).unsqueeze(-2)
-                zeros = torch.zeros_like(kg)
-                kg = torch.stack([kg] + (self.n_dim - 1) * [zeros], dim=-2)
+                eye = torch.eye(self.n_dim, dtype=self.dtype,
+                                device=self.device)
+                # Index as (l, a, k, b), then flatten each node with
+                # its direction to reach the element DOF ordering.
+                kg = torch.einsum("...lk,ab->...lakb", BSB, eye)
                 kg = kg.reshape(-1, self.n_dim * n_nod, self.n_dim * n_nod)
                 k += w * self.compute_k(detJ, kg)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1285,15 +1288,18 @@ class FEM(ABC):
             breakpoint()
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             if nlgeom:
-                # Geometric stiffness
+                # Geometric stiffness. The scalar B_l . sigma . B_k
+                # couples nodes l and k identically in every spatial
+                # direction, so it belongs on all n_dim diagonal
+                # sub-blocks: kg[l*d + a, k*d + b] = delta_ab BSB[l,k].
                 BSB = torch.einsum(
                     "...iq,...qk,...il->...lk", stress[n, i].clone(), B, B
                 )
-                zeros = torch.zeros_like(BSB)
-                kg = torch.stack([BSB] + (self.n_dim - 1) * [zeros], dim=-1)
-                kg = kg.reshape(-1, n_nod, self.n_dim * n_nod).unsqueeze(-2)
-                zeros = torch.zeros_like(kg)
-                kg = torch.stack([kg] + (self.n_dim - 1) * [zeros], dim=-2)
+                eye = torch.eye(self.n_dim, dtype=self.dtype,
+                                device=self.device)
+                # Index as (l, a, k, b), then flatten each node with
+                # its direction to reach the element DOF ordering.
+                kg = torch.einsum("...lk,ab->...lakb", BSB, eye)
                 kg = kg.reshape(-1, self.n_dim * n_nod, self.n_dim * n_nod)
                 k += w * self.compute_k(detJ, kg)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1466,7 +1472,8 @@ class FEM(ABC):
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Check convergence
             if res_norm > rtol * res_norm0 and res_norm > atol:
-                raise Exception("Newton-Raphson iteration did not converge.")
+                raise ConvergenceError(
+                    "Newton-Raphson iteration did not converge.")
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Update increment
             f[n] = F_int.reshape((-1, self.n_dim))

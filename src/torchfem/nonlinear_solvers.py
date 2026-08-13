@@ -20,8 +20,9 @@ when ``||r(u)|| <= max(atol, rtol * ||r(u_0)||)``. The Newton solver
 alone accepts an external reference ``r_norm_ref`` replacing
 ``||r(u_0)||`` in that test; passing it with any other method raises
 ``ValueError``. On failure to
-converge within ``max_iter`` they raise a generic ``Exception`` with
-message containing ``'iteration did not converge.'`` so that the
+converge within ``max_iter`` they raise ``ConvergenceError``, a
+``RuntimeError`` subclass whose message contains
+``'iteration did not converge.'``, so that the
 adaptive sub-incrementation in ``Simulation.run`` continues to handle
 non-convergence transparently.
 
@@ -124,7 +125,7 @@ def solve_nonlinear(
 
     Raises:
         ValueError: If ``method`` is not one of the supported names.
-        Exception: With message containing
+        ConvergenceError: With message containing
             ``'iteration did not converge.'`` if ``max_iter`` is
             reached without satisfying tolerance.
     """
@@ -243,9 +244,21 @@ def _maybe_record(history: Optional[list], r_norm: Tensor) -> None:
         history.append(r_norm.item())
 
 
-def _not_converged_error(method: str) -> Exception:
+class ConvergenceError(RuntimeError):
+    """A nonlinear solve reached ``max_iter`` without converging.
+
+    Adaptive sub-incrementation is the standard response: catch this,
+    halve the increment and retry. It derives from ``RuntimeError`` so
+    that the ordinary ``except RuntimeError`` a driver already uses for
+    a constitutive refusal covers an exhausted iteration too, and from
+    ``Exception`` so that callers written against the older contract,
+    which raised a bare ``Exception``, keep working unchanged.
+    """
+
+
+def _not_converged_error(method: str) -> ConvergenceError:
     """Build the standard non-convergence exception."""
-    return Exception(
+    return ConvergenceError(
         f'{method} iteration did not converge.'
     )
 
