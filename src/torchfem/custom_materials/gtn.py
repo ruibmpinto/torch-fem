@@ -590,7 +590,18 @@ def gtn_return_map(sigma_n, peeq_m_n, f_n, dlam_warm, de_mech, C,
             phi_probe = evaluate(probe_lam)[0]
             dphi_dlam, = torch.autograd.grad(phi_probe.sum(), probe_lam)
             phi_star = evaluate(lam_star)[0]
-            lam_conv = lam_star - phi_star / dphi_dlam.detach()
+            # A vanishing slope has no implicit derivative to give;
+            # documented choice, the root keeps the zero sensitivity
+            # rather than an infinite one.
+            slope = dphi_dlam.detach()
+            correction = torch.where(
+                slope.abs() > 1.0e-30,
+                -phi_star / torch.where(slope.abs() > 1.0e-30, slope,
+                                        torch.ones_like(slope)),
+                torch.zeros_like(phi_star))
+            # Zero in value and the implicit derivative in the tape, so
+            # the returned root is the bisection's to the last bit.
+            lam_conv = lam_star + (correction - correction.detach())
             phi_conv, ep_conv, f_conv, sig_conv = evaluate(lam_conv)
         # A converged plastic state with zero matrix plastic strain
         # is the degenerate cavitation collapse (total stress
