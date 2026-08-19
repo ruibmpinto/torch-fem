@@ -579,6 +579,19 @@ def gtn_return_map(sigma_n, peeq_m_n, f_n, dlam_warm, de_mech, C,
                 f'GTN bisection did not converge for {n_open} '
                 f'element(s) within max_iter={max_iter} '
                 f'(tol={tol}).')
+        # A bisection has no usable tape: its output is arithmetic on
+        # the bracket, so autograd returns the derivative of the
+        # midpoint formula instead of the root's sensitivity
+        # -dPhi/dx / dPhi/dlam. One Newton correction restores it,
+        # exact in value because |Phi| <= tol at the converged root.
+        if torch.is_grad_enabled():
+            lam_star = lam_conv.detach()
+            probe_lam = lam_star.clone().requires_grad_(True)
+            phi_probe = evaluate(probe_lam)[0]
+            dphi_dlam, = torch.autograd.grad(phi_probe.sum(), probe_lam)
+            phi_star = evaluate(lam_star)[0]
+            lam_conv = lam_star - phi_star / dphi_dlam.detach()
+            phi_conv, ep_conv, f_conv, sig_conv = evaluate(lam_conv)
         # A converged plastic state with zero matrix plastic strain
         # is the degenerate cavitation collapse (total stress
         # relaxation at zero dissipation): physically it signals
